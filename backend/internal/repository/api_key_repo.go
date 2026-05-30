@@ -691,7 +691,7 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 	if g == nil {
 		return nil
 	}
-	return &service.Group{
+	out := &service.Group{
 		ID:                              g.ID,
 		Name:                            g.Name,
 		Description:                     derefString(g.Description),
@@ -726,9 +726,13 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		MessagesDispatchModelConfig:     g.MessagesDispatchModelConfig,
 		ModelsListConfig:                g.ModelsListConfig,
 		RPMLimit:                        g.RpmLimit,
+		KiroCacheEmulationEnabled:       g.KiroCacheEmulationEnabled,
+		KiroCacheEmulationRatio:         g.KiroCacheEmulationRatio,
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}
+	service.NormalizeGroupRuntimeFields(out)
+	return out
 }
 
 func derefString(s *string) string {

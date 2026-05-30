@@ -49,6 +49,7 @@ type SessionContext struct {
 	ClientIP  string
 	UserAgent string
 	APIKeyID  int64
+	UserID    int64
 }
 
 // ParsedRequest 保存网关请求的预解析结果
@@ -78,6 +79,9 @@ type ParsedRequest struct {
 
 	// GroupID 请求所属分组 ID（来自 API Key）
 	GroupID *int64
+
+	// Group 请求所属分组快照（来自 API Key 认证缓存），供请求热路径使用，避免二次查库。
+	Group *Group
 
 	// OnUpstreamAccepted 上游接受请求后立即调用（用于提前释放串行锁）
 	// 流式请求在收到 2xx 响应头后调用，避免持锁等流完成

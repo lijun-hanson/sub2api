@@ -467,10 +467,10 @@ export default {
     invitationCodeInvalid: 'Invalid or used invitation code',
     invitationCodeValidating: 'Validating invitation code...',
     invitationCodeInvalidCannotRegister: 'Invalid invitation code. Please check and try again',
-    oauthOrContinue: 'or continue with others',
+    oauthOrContinue: 'or continue with another method',
     linuxdo: {
       signIn: 'Continue with Linux.do',
-      orContinue: 'or continue with email',
+      orContinue: 'or continue with another method',
       callbackTitle: 'Signing you in',
       callbackProcessing: 'Completing login, please wait...',
       callbackHint: 'If you are not redirected automatically, go back to the login page and try again.',
@@ -2149,6 +2149,7 @@ export default {
         openai: 'OpenAI',
         gemini: 'Gemini',
         antigravity: 'Antigravity',
+        kiro: 'Kiro',
       },
       deleteConfirm:
         "Are you sure you want to delete '{name}'? All associated API keys will no longer belong to any group.",
@@ -2168,6 +2169,13 @@ export default {
         defaultValidityDays: 'Default Validity (Days)',
         validityHint: 'Number of days the subscription is valid when assigned to a user',
         noLimit: 'No limit'
+      },
+      kiroCache: {
+        title: 'Kiro Cache Emulation',
+        description: 'Simulate Anthropic prompt cache usage for this Kiro group only.',
+        enabled: 'Enable cache emulation',
+        ratio: 'Cache ratio',
+        ratioHint: '0 to 1. For example, 0.5 applies half of the simulated cache tokens.'
       },
       imagePricing: {
         title: 'Image Generation Pricing',
@@ -3051,6 +3059,7 @@ export default {
         openai: 'OpenAI',
         gemini: 'Gemini',
         antigravity: 'Antigravity',
+        kiro: 'Kiro',
       },
       types: {
         oauth: 'OAuth',
@@ -3058,6 +3067,8 @@ export default {
         responsesApi: 'Responses API',
         googleOauth: 'Google OAuth',
         codeAssist: 'Code Assist',
+        kiroOauth: 'Social OAuth / AWS Builder ID / Import',
+        kiroApikey: 'Connect via Base URL + API Key',
         antigravityOauth: 'Antigravity OAuth',
         antigravityApikey: 'Connect via Base URL + API Key',
         upstream: 'Upstream',
@@ -3079,8 +3090,12 @@ export default {
         rateLimitedAutoResume: 'Auto resumes in {time}',
         modelRateLimitedUntil: '{model} rate limited until {time}',
         modelCreditOveragesUntil: '{model} using AI Credits until {time}',
+        overageActive: 'Overage',
+        overageActiveUntil: 'Using overage until the reset window at {time}',
         creditsExhausted: 'Credits Exhausted',
         creditsExhaustedUntil: 'AI Credits exhausted, expected recovery at {time}',
+        overageExhausted: 'Overage Exhausted',
+        overageExhaustedUntil: 'Overage exhausted, expected recovery at {time}',
         overloadedUntil: 'Overloaded until {time}',
         viewTempUnschedDetails: 'View temp unschedulable details'
       },
@@ -3270,6 +3285,10 @@ export default {
       bulkDeleteSuccess: 'Deleted {count} account(s)',
       bulkDeletePartial: 'Partially deleted: {success} succeeded, {failed} failed',
       bulkDeleteFailed: 'Bulk delete failed',
+      bulkResetStatusTitle: 'Bulk Reset Status',
+      bulkResetStatusConfirm: 'Reset the status of {count} selected account(s)?',
+      bulkRefreshTokenTitle: 'Bulk Refresh Token',
+      bulkRefreshTokenConfirm: 'Refresh the token of {count} selected account(s)?',
       recoverState: 'Recover State',
       recoverStateHint: 'Used to recover error, rate-limit, and temporary unschedulable runtime state.',
       recoverStateSuccess: 'Account state recovered successfully',
@@ -3406,6 +3425,10 @@ export default {
         testModeCompact: 'Compact probe',
         modelRestrictionDisabledByPassthrough: 'Automatic passthrough is enabled: model whitelist/mapping will not take effect.',
       },
+      kiro: {
+        baseUrlHint: 'Enter the Base URL of the Kiro-compatible upstream',
+        apiKeyHint: 'API Key for that Kiro upstream',
+      },
       anthropic: {
         apiKeyPassthrough: 'Auto passthrough (auth only)',
         apiKeyPassthroughDesc:
@@ -3416,6 +3439,14 @@ export default {
         webSearchDefault: 'Default',
         webSearchEnabled: 'Enabled',
         webSearchDisabled: 'Disabled',
+        customHeaders: 'Custom Request Headers',
+        customHeadersDesc:
+          'Add custom headers to upstream API requests. Overrides existing headers with the same name. Auth headers (Authorization, x-api-key) are not allowed.',
+        customHeadersHint:
+          'Applied last, overrides existing values. Forbidden: Host, Content-Length, Authorization, x-api-key.',
+        headerNamePlaceholder: 'Header name',
+        headerValuePlaceholder: 'Header value',
+        headerAddRow: 'Add header',
       },
       modelRestriction: 'Model Restriction (Optional)',
       modelWhitelist: 'Model Whitelist',
@@ -3801,20 +3832,65 @@ export default {
           authCode: 'Authorization URL or Code',
           authCodePlaceholder:
             'Option 1: Copy the complete URL\n(http://localhost:xxx/auth/callback?code=...)\nOption 2: Copy only the code parameter value',
-                    authCodeHint: 'You can copy the entire URL or just the code parameter value, the system will auto-detect',
-                    failedToGenerateUrl: 'Failed to generate Antigravity auth URL',
-                    missingExchangeParams: 'Missing code, session ID, or state',
-                    failedToExchangeCode: 'Failed to exchange Antigravity auth code',
-                    // Refresh Token auth
-                    refreshTokenAuth: 'Manual RT',
-                    refreshTokenDesc: 'Enter your existing Antigravity Refresh Token. Supports batch input (one per line). The system will automatically validate and create accounts.',
-                    refreshTokenPlaceholder: 'Paste your Antigravity Refresh Token...\nSupports multiple tokens, one per line',
-                    validating: 'Validating...',
-                    validateAndCreate: 'Validate & Create',
-                    pleaseEnterRefreshToken: 'Please enter Refresh Token',
-                    failedToValidateRT: 'Failed to validate Refresh Token'
-                  }
-                },      // Gemini specific (platform-wide)
+          authCodeHint: 'You can copy the entire URL or just the code parameter value, the system will auto-detect',
+          failedToGenerateUrl: 'Failed to generate Antigravity auth URL',
+          missingExchangeParams: 'Missing code, session ID, or state',
+          failedToExchangeCode: 'Failed to exchange Antigravity auth code',
+          refreshTokenAuth: 'Manual RT',
+          refreshTokenDesc: 'Enter your existing Antigravity Refresh Token. Supports batch input (one per line). The system will automatically validate and create accounts.',
+          refreshTokenPlaceholder: 'Paste your Antigravity Refresh Token...\nSupports multiple tokens, one per line',
+          validating: 'Validating...',
+          validateAndCreate: 'Validate & Create',
+          pleaseEnterRefreshToken: 'Please enter Refresh Token',
+          failedToValidateRT: 'Failed to validate Refresh Token'
+        },
+        kiro: {
+          title: 'Kiro Authorization',
+          followSteps: 'Follow these steps to authorize your Kiro account:',
+          step1GenerateUrl: 'Click the button below to generate the authorization URL',
+          generateAuthUrl: 'Generate Authorization URL',
+          step2OpenUrl: 'Open the URL in your browser and complete authorization',
+          openUrlDesc:
+            'Open the authorization URL in a new tab. The Kiro sign-in page will open at app.kiro.dev; choose Google or GitHub there. After approval, the browser may redirect to http://localhost:49153/oauth/callback and show an unreachable-page error; that is expected.',
+          step3EnterCode: 'Enter Callback URL or Code',
+          authCodeDesc:
+            'After authorization, copy the full callback URL from the browser address bar (recommended), or paste only the code parameter value below.',
+          authCode: 'Callback URL or Code',
+          authCodePlaceholder:
+            'Option 1 (recommended): Paste the full callback URL\n(http://localhost:49153/oauth/callback?code=...&state=...&login_option=github)\nOption 2: Paste only the code value',
+          authCodeHint:
+            'The system will auto-extract code/state and Kiro callback metadata from the URL. If the localhost page cannot be reached, copy the full URL from the address bar.',
+          importDialogTitle: 'Import Kiro Token',
+          authModeTitle: 'Kiro Authorization Method',
+          oauthTitle: 'Social OAuth',
+          oauthSubtitle: 'Browser-based auth with Google or GitHub',
+          oauthProviderTitle: 'Social Sign-In Provider',
+          googleTitle: 'Google',
+          githubTitle: 'GitHub',
+          googleDesc: 'Sign in to Kiro with your Google account',
+          githubDesc: 'Sign in to Kiro with your GitHub account',
+          idcTitle: 'AWS Builder ID / IDC',
+          importTitle: 'Import from Kiro IDE',
+          socialSubtitle: 'Google / GitHub sign-in',
+          idcSubtitle: 'AWS Builder ID or enterprise Identity Center',
+          googleOauth: 'Google OAuth',
+          githubOauth: 'GitHub OAuth',
+          idcLogin: 'Builder ID / IDC Login',
+          importTokenFile: 'Import Token File',
+          importSubtitle: 'Use this if you already signed in via Kiro IDE',
+          startUrlLabel: 'Builder ID / IDC Start URL',
+          idcStartUrlLabel: 'Builder ID / IDC Start URL',
+          startUrlPlaceholder: 'https://view.awsapps.com/start',
+          regionLabel: 'Region',
+          regionPlaceholder: 'us-east-1',
+          tokenJsonLabel: 'Kiro Token JSON',
+          tokenJsonHint: 'Sign in through Kiro IDE first, then paste the contents of `~/.aws/sso/cache/kiro-auth-token.json` here.',
+          deviceRegistrationLabel: 'Device Registration JSON',
+          deviceRegistrationHint: 'Optional. Only needed when the token file does not include full client details and only has `clientIdHash`.',
+          importAndUpdate: 'Import and Update'
+        }
+      },
+      // Gemini specific (platform-wide)
       gemini: {
         helpButton: 'Help',
         helpDialog: {
@@ -3956,6 +4032,7 @@ export default {
       claudeCodeAccount: 'Claude Code Account',
       openaiAccount: 'OpenAI Account',
       geminiAccount: 'Gemini Account',
+      kiroAccount: 'Kiro Account',
       antigravityAccount: 'Antigravity Account',
       inputMethod: 'Input Method',
       reAuthorizedSuccess: 'Account re-authorized successfully',
@@ -4031,6 +4108,12 @@ export default {
         gemini3Flash: 'G3F',
         gemini3Image: 'G31FI',
         claude: 'Claude',
+        kiroCredits: 'Credits',
+        kiroBonus: 'Bonus',
+        kiroReset: 'Reset',
+        kiroOverage: 'Overage',
+        kiroDaysLeft: '{days}d left',
+        kiroExpires: 'Expires',
         passiveSampled: 'Passive',
         activeQuery: 'Query'
       },
@@ -4053,6 +4136,13 @@ export default {
       copyLink: 'Copy Link',
       linkCopied: 'Link Copied',
       needsReauth: 'Re-auth Required',
+      kiroCooldown: 'Kiro Cooldown',
+      kiroSuspended: 'Kiro Suspended',
+      kiroProfileError: 'Profile Error',
+      kiroProfileHint: 'Resolve and save a valid profileArn for this account',
+      kiroUsageForbidden: 'Usage Forbidden',
+      kiroUsageForbiddenHint: 'Usage fetch is blocked for this account, but request forwarding may still work',
+      kiroRuntimeResetsAt: 'Auto resumes at {time}',
       rateLimited: 'Rate Limited',
       usageError: 'Fetch Error'
     },
