@@ -33,27 +33,6 @@
 
 Sub2API 是一个 AI API 网关平台，用于分发和管理 AI 产品订阅的 API 配额。用户通过平台生成的 API Key 调用上游 AI 服务，平台负责鉴权、计费、负载均衡和请求转发。
 
-## Kiro 支持 Fork
-
-由于官方上游项目对 Kiro 渠道的维护意愿不高，本仓库维护了一个长期支持 Kiro 的 fork，并保持与官方分支稳定合并。
-
-本 fork 额外提供的 Kiro 相关能力：
-
-- Kiro 渠道支持，包括 OAuth / AWS Builder ID / Token 导入，以及兼容 API Key 的上游接入。
-- 面向 Kiro 流量的 Anthropic Prompt Cache 用量模拟。
-- 按分组配置 Kiro 模拟缓存开关，并支持调整模拟比例。
-
-## Kiro 功能截图
-
-<p align="center">
-  <img src="assets/screenshots/kiro-account-management.png" alt="Kiro 账号管理" width="100%">
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/kiro-add-account.png" alt="添加 Kiro 账号" width="58%">
-  <img src="assets/screenshots/kiro-cache-emulation.png" alt="Kiro 分组模拟缓存配置" width="35%">
-</p>
-
 ## 核心功能
 
 - **多账号管理** - 支持多种上游账号类型（OAuth、API Key）
