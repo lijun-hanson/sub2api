@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1444,24 +1443,6 @@ func budgetToEffort(budgetTokens int) string {
 	default:
 		return "xhigh"
 	}
-}
-
-func shouldUseFastEmptySystemPrompt(claudeBody []byte, baseSystem string, thinking *thinkingDirective, toolChoiceHint string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUB2API_KIRO_FAST_EMPTY_SYSTEM"))) {
-	case "1", "true", "yes", "on":
-	default:
-		return false
-	}
-	if strings.TrimSpace(baseSystem) != "" || thinking != nil || strings.TrimSpace(toolChoiceHint) != "" {
-		return false
-	}
-	if !isToolChoiceNone(claudeBody) {
-		tools := gjson.GetBytes(claudeBody, "tools")
-		if tools.IsArray() && len(tools.Array()) > 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func extractClaudeToolChoiceHint(claudeBody []byte, requestCtx *KiroRequestContext) string {
