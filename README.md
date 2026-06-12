@@ -24,13 +24,6 @@ Please read the following carefully before using this project:
 - **⚖️ Compliant Use**: Use this project only in compliance with the laws and regulations of your country or region. Any unlawful use is strictly prohibited.
 - **📖 Disclaimer**: This project is provided for technical learning and research purposes only. The authors assume no liability for account bans, service interruptions, data loss, or any other direct or indirect damages resulting from the use of this project.
 
-## Community
-
-- **Telegram**: [Join the group](https://t.me/+Pv3T6ncordwxOTZl)
-- **WeChat**: scan the QR code below
-
-<img src="https://github.com/user-attachments/assets/bbf5eb3b-aa72-4494-b9a3-0fc50e03f96c" alt="WeChat group QR code" width="280">
-
 ## Overview
 
 Sub2API is an AI API gateway platform designed to distribute and manage API quotas from AI product subscriptions. Users can access upstream AI services through platform-generated API Keys, while the platform handles authentication, billing, load balancing, and request forwarding.
@@ -44,17 +37,6 @@ Additional Kiro-focused features in this fork:
 - Kiro channel support, including OAuth / AWS Builder ID / token import and API-key-compatible upstream access.
 - Anthropic Prompt Cache usage emulation for Kiro traffic.
 - Per-group Kiro cache emulation controls, including an adjustable emulation ratio.
-
-## Kiro Screenshots
-
-<p align="center">
-  <img src="assets/screenshots/kiro-add-account.png" alt="Add Kiro account" width="58%">
-  <img src="assets/screenshots/kiro-cache-emulation.png" alt="Kiro cache emulation group settings" width="35%">
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/kiro-account-management.png" alt="Kiro account management" width="100%">
-</p>
 
 ## Features
 

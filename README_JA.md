@@ -38,17 +38,6 @@ Sub2API は、AI 製品のサブスクリプションから API クォータを�
 - Kiro トラフィック向けの Anthropic Prompt Cache 使用量エミュレーション。
 - グループ単位での Kiro キャッシュエミュレーション設定と、エミュレーション比率の調整。
 
-## Kiro スクリーンショット
-
-<p align="center">
-  <img src="assets/screenshots/kiro-account-management.png" alt="Kiro account management" width="100%">
-</p>
-
-<p align="center">
-  <img src="assets/screenshots/kiro-add-account.png" alt="Add Kiro account" width="58%">
-  <img src="assets/screenshots/kiro-cache-emulation.png" alt="Kiro cache emulation group settings" width="35%">
-</p>
-
 ## 機能
 
 - **マルチアカウント管理** - 複数の上流アカウントタイプ（OAuth、APIキー）をサポート
