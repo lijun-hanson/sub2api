@@ -70,6 +70,8 @@ func (r *groupRepository) Create(ctx context.Context, groupIn *service.Group) er
 		SetModelsListConfig(groupIn.ModelsListConfig).
 		SetRpmLimit(groupIn.RPMLimit).
 		SetKiroCacheEmulationEnabled(groupIn.KiroCacheEmulationEnabled).
+		SetKiroAutoStickyEnabled(groupIn.KiroAutoStickyEnabled).
+		SetKiroStickySessionTTLSeconds(groupIn.KiroStickySessionTTLSeconds).
 		SetKiroCacheEmulationRatio(groupIn.KiroCacheEmulationRatio)
 
 	// 设置模型路由配置
@@ -149,6 +151,8 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		SetModelsListConfig(groupIn.ModelsListConfig).
 		SetRpmLimit(groupIn.RPMLimit).
 		SetKiroCacheEmulationEnabled(groupIn.KiroCacheEmulationEnabled).
+		SetKiroAutoStickyEnabled(groupIn.KiroAutoStickyEnabled).
+		SetKiroStickySessionTTLSeconds(groupIn.KiroStickySessionTTLSeconds).
 		SetKiroCacheEmulationRatio(groupIn.KiroCacheEmulationRatio)
 
 	// 显式处理可空字段：nil 需要 clear，非 nil 需要 set。

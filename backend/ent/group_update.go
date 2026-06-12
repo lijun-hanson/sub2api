@@ -665,6 +665,41 @@ func (_u *GroupUpdate) SetNillableKiroCacheEmulationEnabled(v *bool) *GroupUpdat
 	return _u
 }
 
+// SetKiroAutoStickyEnabled sets the "kiro_auto_sticky_enabled" field.
+func (_u *GroupUpdate) SetKiroAutoStickyEnabled(v bool) *GroupUpdate {
+	_u.mutation.SetKiroAutoStickyEnabled(v)
+	return _u
+}
+
+// SetNillableKiroAutoStickyEnabled sets the "kiro_auto_sticky_enabled" field if the given value is not nil.
+func (_u *GroupUpdate) SetNillableKiroAutoStickyEnabled(v *bool) *GroupUpdate {
+	if v != nil {
+		_u.SetKiroAutoStickyEnabled(*v)
+	}
+	return _u
+}
+
+// SetKiroStickySessionTTLSeconds sets the "kiro_sticky_session_ttl_seconds" field.
+func (_u *GroupUpdate) SetKiroStickySessionTTLSeconds(v int) *GroupUpdate {
+	_u.mutation.ResetKiroStickySessionTTLSeconds()
+	_u.mutation.SetKiroStickySessionTTLSeconds(v)
+	return _u
+}
+
+// SetNillableKiroStickySessionTTLSeconds sets the "kiro_sticky_session_ttl_seconds" field if the given value is not nil.
+func (_u *GroupUpdate) SetNillableKiroStickySessionTTLSeconds(v *int) *GroupUpdate {
+	if v != nil {
+		_u.SetKiroStickySessionTTLSeconds(*v)
+	}
+	return _u
+}
+
+// AddKiroStickySessionTTLSeconds adds value to the "kiro_sticky_session_ttl_seconds" field.
+func (_u *GroupUpdate) AddKiroStickySessionTTLSeconds(v int) *GroupUpdate {
+	_u.mutation.AddKiroStickySessionTTLSeconds(v)
+	return _u
+}
+
 // SetKiroCacheEmulationRatio sets the "kiro_cache_emulation_ratio" field.
 func (_u *GroupUpdate) SetKiroCacheEmulationRatio(v float64) *GroupUpdate {
 	_u.mutation.ResetKiroCacheEmulationRatio()
@@ -1172,6 +1207,15 @@ func (_u *GroupUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.KiroCacheEmulationEnabled(); ok {
 		_spec.SetField(group.FieldKiroCacheEmulationEnabled, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.KiroAutoStickyEnabled(); ok {
+		_spec.SetField(group.FieldKiroAutoStickyEnabled, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.KiroStickySessionTTLSeconds(); ok {
+		_spec.SetField(group.FieldKiroStickySessionTTLSeconds, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedKiroStickySessionTTLSeconds(); ok {
+		_spec.AddField(group.FieldKiroStickySessionTTLSeconds, field.TypeInt, value)
 	}
 	if value, ok := _u.mutation.KiroCacheEmulationRatio(); ok {
 		_spec.SetField(group.FieldKiroCacheEmulationRatio, field.TypeFloat64, value)
@@ -2122,6 +2166,41 @@ func (_u *GroupUpdateOne) SetNillableKiroCacheEmulationEnabled(v *bool) *GroupUp
 	return _u
 }
 
+// SetKiroAutoStickyEnabled sets the "kiro_auto_sticky_enabled" field.
+func (_u *GroupUpdateOne) SetKiroAutoStickyEnabled(v bool) *GroupUpdateOne {
+	_u.mutation.SetKiroAutoStickyEnabled(v)
+	return _u
+}
+
+// SetNillableKiroAutoStickyEnabled sets the "kiro_auto_sticky_enabled" field if the given value is not nil.
+func (_u *GroupUpdateOne) SetNillableKiroAutoStickyEnabled(v *bool) *GroupUpdateOne {
+	if v != nil {
+		_u.SetKiroAutoStickyEnabled(*v)
+	}
+	return _u
+}
+
+// SetKiroStickySessionTTLSeconds sets the "kiro_sticky_session_ttl_seconds" field.
+func (_u *GroupUpdateOne) SetKiroStickySessionTTLSeconds(v int) *GroupUpdateOne {
+	_u.mutation.ResetKiroStickySessionTTLSeconds()
+	_u.mutation.SetKiroStickySessionTTLSeconds(v)
+	return _u
+}
+
+// SetNillableKiroStickySessionTTLSeconds sets the "kiro_sticky_session_ttl_seconds" field if the given value is not nil.
+func (_u *GroupUpdateOne) SetNillableKiroStickySessionTTLSeconds(v *int) *GroupUpdateOne {
+	if v != nil {
+		_u.SetKiroStickySessionTTLSeconds(*v)
+	}
+	return _u
+}
+
+// AddKiroStickySessionTTLSeconds adds value to the "kiro_sticky_session_ttl_seconds" field.
+func (_u *GroupUpdateOne) AddKiroStickySessionTTLSeconds(v int) *GroupUpdateOne {
+	_u.mutation.AddKiroStickySessionTTLSeconds(v)
+	return _u
+}
+
 // SetKiroCacheEmulationRatio sets the "kiro_cache_emulation_ratio" field.
 func (_u *GroupUpdateOne) SetKiroCacheEmulationRatio(v float64) *GroupUpdateOne {
 	_u.mutation.ResetKiroCacheEmulationRatio()
@@ -2659,6 +2738,15 @@ func (_u *GroupUpdateOne) sqlSave(ctx context.Context) (_node *Group, err error)
 	}
 	if value, ok := _u.mutation.KiroCacheEmulationEnabled(); ok {
 		_spec.SetField(group.FieldKiroCacheEmulationEnabled, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.KiroAutoStickyEnabled(); ok {
+		_spec.SetField(group.FieldKiroAutoStickyEnabled, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.KiroStickySessionTTLSeconds(); ok {
+		_spec.SetField(group.FieldKiroStickySessionTTLSeconds, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedKiroStickySessionTTLSeconds(); ok {
+		_spec.AddField(group.FieldKiroStickySessionTTLSeconds, field.TypeInt, value)
 	}
 	if value, ok := _u.mutation.KiroCacheEmulationRatio(); ok {
 		_spec.SetField(group.FieldKiroCacheEmulationRatio, field.TypeFloat64, value)

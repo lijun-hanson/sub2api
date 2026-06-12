@@ -461,22 +461,12 @@
                     >
                       {{ t("admin.settings.streamTimeout.action") }}
                     </label>
-                    <select
-                      v-model="streamTimeoutForm.action"
-                      class="input w-64"
-                    >
-                      <option value="temp_unsched">
-                        {{
-                          t("admin.settings.streamTimeout.actionTempUnsched")
-                        }}
-                      </option>
-                      <option value="error">
-                        {{ t("admin.settings.streamTimeout.actionError") }}
-                      </option>
-                      <option value="none">
-                        {{ t("admin.settings.streamTimeout.actionNone") }}
-                      </option>
-                    </select>
+                    <div class="w-64">
+                      <Select
+                        v-model="streamTimeoutForm.action"
+                        :options="streamTimeoutActionOptions"
+                      />
+                    </div>
                     <p class="mt-1.5 text-xs text-gray-500 dark:text-gray-400">
                       {{ t("admin.settings.streamTimeout.actionHint") }}
                     </p>
@@ -2910,18 +2900,10 @@
                     >
                       {{ t("admin.settings.oidc.tokenAuthMethod") }}
                     </label>
-                    <select
+                    <Select
                       v-model="form.oidc_connect_token_auth_method"
-                      class="input font-mono text-sm"
-                    >
-                      <option value="client_secret_post">
-                        client_secret_post
-                      </option>
-                      <option value="client_secret_basic">
-                        client_secret_basic
-                      </option>
-                      <option value="none">none</option>
-                    </select>
+                      :options="oidcTokenAuthMethodOptions"
+                    />
                   </div>
 
                   <div>
@@ -4398,6 +4380,35 @@
               </div>
             </div>
           </div>
+
+        <!-- Usage Records Settings -->
+        <div class="card">
+          <div class="border-b border-gray-100 px-6 py-4 dark:border-dark-700">
+            <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+              {{ t('admin.settings.usageRecords.title') }}
+            </h2>
+            <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+              {{ t('admin.settings.usageRecords.description') }}
+            </p>
+          </div>
+          <div class="space-y-4 p-6">
+            <!-- User error requests visibility -->
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                  {{ t('admin.settings.user_error_view.label') }}
+                </label>
+                <p class="text-xs text-gray-500 dark:text-gray-400">
+                  {{ t('admin.settings.user_error_view.description') }}
+                </p>
+              </div>
+              <label class="toggle">
+                <input v-model="form.allow_user_view_error_requests" type="checkbox" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
         </div>
         <!-- /Tab: Gateway — Claude Code, Scheduling -->
 
@@ -4878,14 +4889,10 @@
                     >
                       {{ t("admin.settings.customMenu.visibility") }}
                     </label>
-                    <select v-model="item.visibility" class="input text-sm">
-                      <option value="user">
-                        {{ t("admin.settings.customMenu.visibilityUser") }}
-                      </option>
-                      <option value="admin">
-                        {{ t("admin.settings.customMenu.visibilityAdmin") }}
-                      </option>
-                    </select>
+                    <Select
+                      v-model="item.visibility"
+                      :options="customMenuVisibilityOptions"
+                    />
                   </div>
 
                   <!-- URL (full width) -->
@@ -6750,6 +6757,22 @@ import {
 } from "@/utils/registrationEmailPolicy";
 
 const { t, locale } = useI18n();
+
+// Select 选项（i18n label 用 computed 保证切换语言响应式）
+const streamTimeoutActionOptions = computed(() => [
+  { value: "temp_unsched", label: t("admin.settings.streamTimeout.actionTempUnsched") },
+  { value: "error", label: t("admin.settings.streamTimeout.actionError") },
+  { value: "none", label: t("admin.settings.streamTimeout.actionNone") },
+]);
+const oidcTokenAuthMethodOptions = [
+  { value: "client_secret_post", label: "client_secret_post" },
+  { value: "client_secret_basic", label: "client_secret_basic" },
+  { value: "none", label: "none" },
+];
+const customMenuVisibilityOptions = computed(() => [
+  { value: "user", label: t("admin.settings.customMenu.visibilityUser") },
+  { value: "admin", label: t("admin.settings.customMenu.visibilityAdmin") },
+]);
 const appStore = useAppStore();
 const adminSettingsStore = useAdminSettingsStore();
 const isZhLocale = computed(() => locale.value.startsWith("zh"));
@@ -7216,6 +7239,8 @@ const form = reactive<SettingsForm>({
   available_channels_enabled: false,
   // Affiliate (邀请返利) feature switch
   affiliate_enabled: false,
+  // Allow user view error requests
+  allow_user_view_error_requests: false,
 });
 
 const authSourceDefaults = reactive<AuthSourceDefaultsState>(
@@ -8364,6 +8389,7 @@ async function saveSettings() {
       available_channels_enabled: form.available_channels_enabled,
       // Affiliate (邀请返利) feature switch
       affiliate_enabled: form.affiliate_enabled,
+      allow_user_view_error_requests: form.allow_user_view_error_requests,
     };
 
     // 仅当 openai_fast_policy_settings 已成功从后端加载时才回写，
