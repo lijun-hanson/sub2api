@@ -297,6 +297,61 @@ func TestBuildKiroPayloadInjectsAdaptiveThinkingForOpus46ThinkingModel(t *testin
 	require.Contains(t, systemContent, "[Context: Current time is ")
 }
 
+func TestBuildKiroPayloadAddsAdditionalModelRequestFieldsForOutputConfigModels(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       []byte
+		modelID    string
+		wantEffort string
+	}{
+		{
+			name: "adaptive effort",
+			body: []byte(`{
+				"model":"claude-opus-4-9",
+				"thinking":{"type":"adaptive","effort":"medium"},
+				"output_config":{"effort":"medium"},
+				"messages":[{"role":"user","content":"hello kiro"}]
+			}`),
+			modelID:    "claude-opus-4.9",
+			wantEffort: "medium",
+		},
+		{
+			name: "enabled budget mapping",
+			body: []byte(`{
+				"model":"claude-sonnet-4-6",
+				"thinking":{"type":"enabled","budget_tokens":12000},
+				"messages":[{"role":"user","content":"hello kiro"}]
+			}`),
+			modelID:    "claude-sonnet-4.6",
+			wantEffort: "medium",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := BuildKiroPayloadWithContext(tc.body, tc.modelID, "", "AI_EDITOR", nil)
+			require.NoError(t, err)
+			payload := result.Payload
+
+			require.Equal(t, "adaptive", gjson.GetBytes(payload, "additionalModelRequestFields.thinking.type").String())
+			require.Equal(t, "summarized", gjson.GetBytes(payload, "additionalModelRequestFields.thinking.display").String())
+			require.Equal(t, tc.wantEffort, gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String())
+		})
+	}
+}
+
+func TestBuildKiroPayloadSkipsAdditionalModelRequestFieldsForLegacyThinkingModel(t *testing.T) {
+	body := []byte(`{
+		"model":"claude-sonnet-4-5-20250929-thinking",
+		"thinking":{"type":"enabled","budget_tokens":12000},
+		"messages":[{"role":"user","content":"hello kiro"}]
+	}`)
+
+	result, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", nil)
+	require.NoError(t, err)
+	require.False(t, gjson.GetBytes(result.Payload, "additionalModelRequestFields").Exists())
+}
+
 // 客户端未请求 thinking 但模型是 Opus 4.7/4.8 时,解析器仍需开启 <thinking> tag 抽取,
 // 否则上游 CoT 文本会原样泄漏到 assistant 正文。
 func TestBuildKiroPayloadEnablesImplicitThinkingTagStrippingForOpus47And48(t *testing.T) {
@@ -1545,6 +1600,9 @@ func TestMapModel_MatchesKiroReferenceMapping(t *testing.T) {
 		"claude-sonnet-4-6":                   "claude-sonnet-4.6",
 		"claude-sonnet-4-6-thinking":          "claude-sonnet-4.6",
 		"claude-sonnet-4.6":                   "claude-sonnet-4.6",
+		"claude-opus-4-9":                     "claude-opus-4.9",
+		"claude-opus-4-9-thinking":            "claude-opus-4.9",
+		"claude-sonnet-5-0-thinking":          "claude-sonnet-5.0",
 		"claude-sonnet-4-5-20250929":          "claude-sonnet-4.5",
 		"claude-sonnet-4-5-20250929-thinking": "claude-sonnet-4.5",
 		"claude-sonnet-4.5":                   "claude-sonnet-4.5",
@@ -1581,6 +1639,23 @@ func TestMapModel_MatchesKiroReferenceMapping(t *testing.T) {
 		if got := MapModel(input); got != "" {
 			t.Fatalf("MapModel(%q) = %q, want empty", input, got)
 		}
+	}
+}
+
+func TestIsOutputConfigPathModelSupportsFutureVersions(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]bool{
+		"claude-opus-4.6":            true,
+		"claude-opus-4-9-thinking":   true,
+		"claude-sonnet-5-0-thinking": true,
+		"claude-haiku-4.5":           false,
+		"claude-opus-4-5":            false,
+		"gpt-4o":                     false,
+	}
+
+	for modelID, want := range cases {
+		require.Equal(t, want, isOutputConfigPathModel(modelID), modelID)
 	}
 }
 

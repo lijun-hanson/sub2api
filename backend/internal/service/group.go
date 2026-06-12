@@ -69,8 +69,10 @@ type Group struct {
 	RPMLimit int
 
 	// Kiro 模拟缓存配置（仅 Kiro 平台生效）。
-	KiroCacheEmulationEnabled bool
-	KiroCacheEmulationRatio   float64
+	KiroCacheEmulationEnabled   bool
+	KiroAutoStickyEnabled       bool
+	KiroStickySessionTTLSeconds int
+	KiroCacheEmulationRatio     float64
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -85,11 +87,49 @@ func (g *Group) EffectiveKiroCacheEmulationEnabled() bool {
 	return g != nil && g.Platform == PlatformKiro && g.KiroCacheEmulationEnabled && g.EffectiveKiroCacheEmulationRatio() > 0
 }
 
+func (g *Group) EffectiveKiroAutoStickyEnabled() bool {
+	return g != nil && g.Platform == PlatformKiro && g.KiroAutoStickyEnabled
+}
+
+const (
+	DefaultKiroStickySessionTTLSeconds = 3600
+	MinKiroStickySessionTTLSeconds     = 60
+	MaxKiroStickySessionTTLSeconds     = 86400
+)
+
+func (g *Group) EffectiveKiroStickySessionTTLSeconds() int {
+	if g == nil || g.Platform != PlatformKiro {
+		return 0
+	}
+	return normalizeKiroStickySessionTTLSeconds(g.KiroStickySessionTTLSeconds)
+}
+
+func (g *Group) EffectiveKiroStickySessionTTL() time.Duration {
+	seconds := g.EffectiveKiroStickySessionTTLSeconds()
+	if seconds <= 0 {
+		return stickySessionTTL
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func (g *Group) EffectiveKiroCacheEmulationRatio() float64 {
 	if g == nil || g.Platform != PlatformKiro || !g.KiroCacheEmulationEnabled {
 		return 0
 	}
 	return normalizeKiroCacheEmulationRatio(g.KiroCacheEmulationRatio)
+}
+
+func normalizeKiroStickySessionTTLSeconds(seconds int) int {
+	if seconds <= 0 {
+		return DefaultKiroStickySessionTTLSeconds
+	}
+	if seconds < MinKiroStickySessionTTLSeconds {
+		return MinKiroStickySessionTTLSeconds
+	}
+	if seconds > MaxKiroStickySessionTTLSeconds {
+		return MaxKiroStickySessionTTLSeconds
+	}
+	return seconds
 }
 
 func normalizeKiroCacheEmulationRatio(ratio float64) float64 {
@@ -110,10 +150,13 @@ func normalizeKiroCacheEmulationFields(g *Group) {
 		return
 	}
 	if g.Platform != PlatformKiro {
+		g.KiroAutoStickyEnabled = false
+		g.KiroStickySessionTTLSeconds = 0
 		g.KiroCacheEmulationEnabled = false
 		g.KiroCacheEmulationRatio = 0
 		return
 	}
+	g.KiroStickySessionTTLSeconds = normalizeKiroStickySessionTTLSeconds(g.KiroStickySessionTTLSeconds)
 	if g.KiroCacheEmulationRatio == 0 {
 		g.KiroCacheEmulationRatio = 1
 	}
