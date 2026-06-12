@@ -162,8 +162,9 @@ func ProvideKiroCooldownStore(redisClient *redis.Client) KiroCooldownStore {
 }
 
 // ProvideDashboardAggregationService 创建并启动仪表盘聚合服务
-func ProvideDashboardAggregationService(repo DashboardAggregationRepository, timingWheel *TimingWheelService, cfg *config.Config) *DashboardAggregationService {
+func ProvideDashboardAggregationService(repo DashboardAggregationRepository, timingWheel *TimingWheelService, lockCache LeaderLockCache, db *sql.DB, cfg *config.Config) *DashboardAggregationService {
 	svc := NewDashboardAggregationService(repo, timingWheel, cfg)
+	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc
 }
@@ -182,11 +183,19 @@ func ProvideAccountExpiryService(accountRepo AccountRepository) *AccountExpirySe
 	return svc
 }
 
+// ProvideProxyExpiryService creates and starts ProxyExpiryService.
+func ProvideProxyExpiryService(proxyRepo ProxyRepository) *ProxyExpiryService {
+	svc := NewProxyExpiryService(proxyRepo, time.Minute)
+	svc.Start()
+	return svc
+}
+
 // ProvideSubscriptionExpiryService creates and starts SubscriptionExpiryService.
-func ProvideSubscriptionExpiryService(userSubRepo UserSubscriptionRepository, settingRepo SettingRepository, notificationEmailService *NotificationEmailService) *SubscriptionExpiryService {
+func ProvideSubscriptionExpiryService(userSubRepo UserSubscriptionRepository, settingRepo SettingRepository, notificationEmailService *NotificationEmailService, lockCache LeaderLockCache, db *sql.DB) *SubscriptionExpiryService {
 	svc := NewSubscriptionExpiryService(userSubRepo, time.Minute)
 	svc.SetSettingRepository(settingRepo)
 	svc.SetNotificationEmailService(notificationEmailService)
+	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc
 }
@@ -298,8 +307,9 @@ func ProvideOpsAlertEvaluatorService(
 	emailService *EmailService,
 	redisClient *redis.Client,
 	cfg *config.Config,
+	proxyRepo ProxyRepository,
 ) *OpsAlertEvaluatorService {
-	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, emailService, redisClient, cfg)
+	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, emailService, redisClient, cfg, proxyRepo)
 	svc.Start()
 	return svc
 }
@@ -575,6 +585,7 @@ var ProviderSet = wire.NewSet(
 	ProvideUpdateService,
 	ProvideTokenRefreshService,
 	ProvideAccountExpiryService,
+	ProvideProxyExpiryService,
 	ProvideSubscriptionExpiryService,
 	ProvideTimingWheelService,
 	ProvideDashboardAggregationService,
@@ -635,8 +646,9 @@ func ProvidePaymentService(entClient *dbent.Client, registry *payment.Registry, 
 }
 
 // ProvidePaymentOrderExpiryService creates and starts PaymentOrderExpiryService.
-func ProvidePaymentOrderExpiryService(paymentSvc *PaymentService) *PaymentOrderExpiryService {
+func ProvidePaymentOrderExpiryService(paymentSvc *PaymentService, lockCache LeaderLockCache, db *sql.DB) *PaymentOrderExpiryService {
 	svc := NewPaymentOrderExpiryService(paymentSvc, 60*time.Second)
+	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc
 }

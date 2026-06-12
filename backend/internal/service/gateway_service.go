@@ -737,7 +737,14 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		return ""
 	}
 
-	// 1. 最高优先级：从 metadata.user_id 提取 session_xxx
+	// 0. 最高优先级：客户端通过 HTTP 请求头显式传递的 Session ID。
+	//    由 Handler 从 X-Session-ID / Anthropic-Session-Id 等 header 写入 ExplicitSessionID。
+	//    混入 APIKeyID 隔离不同用户使用相同 session id（如都用 "default"）的情况。
+	if hash, ok := s.hashStickySessionHint(parsed, parsed.ExplicitSessionID, "explicit_session_header"); ok {
+		return hash
+	}
+
+	// 1. 从 metadata.user_id 提取 session_xxx（Claude Code 等客户端的标准会话标识）
 	if parsed.MetadataUserID != "" {
 		uid := ParseMetadataUserID(parsed.MetadataUserID)
 		if uid != nil && uid.SessionID != "" {
@@ -755,6 +762,12 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		)
 	}
 
+	// 1.5. 从请求体提取客户端已经提供的稳定会话标识。
+	// 支持 prompt_cache_key/conversation_id/thread_id/session_id 及 metadata 下同名字段。
+	if hash, ok := s.hashStickySessionHint(parsed, parsed.BodySessionID, "body_session_id"); ok {
+		return hash
+	}
+
 	// 2. 提取带 cache_control: {type: "ephemeral"} 的内容
 	cacheableContent := s.extractCacheableContent(parsed)
 	if cacheableContent != "" {
@@ -764,6 +777,46 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 			"hash", hash,
 		)
 		return hash
+	}
+
+	// 2.5. Kiro 分组专用：使用对话生命周期内稳定的内容做 hash
+	//
+	// 背景：Kiro 采用 stateless replay 架构，每次请求都生成新的 conversationId，
+	// 无法依赖 conversationId 做粘性。同时 Claude Code / cursor 等客户端通常
+	// 不传 metadata.user_id，也不使用 cache_control: ephemeral。
+	//
+	// 解法：优先用 system prompt；如果客户端没有传 system prompt，则退到第一条 user
+	// 消息。它们在同一对话后续轮次中通常保持不变，而完整 messages 会每轮追加导致 hash
+	// 变化。混入 APIKeyID 后，可以让同一个 API Key 下的同一对话固定路由到同一账号。
+	if isKiroGroup(parsed.Group) {
+		if !parsed.Group.EffectiveKiroAutoStickyEnabled() {
+			slog.Info("sticky.hash_source",
+				"source", "kiro_auto_sticky_disabled",
+			)
+			return ""
+		}
+		stableSeed := extractTextFromSystemRaw(parsed.SystemRaw())
+		source := "kiro_system_prompt"
+		if stableSeed == "" {
+			stableSeed = extractFirstUserMessageTextFromRaw(parsed.MessagesRaw())
+			source = "kiro_first_user_message"
+		}
+		if stableSeed != "" {
+			var sb strings.Builder
+			if parsed.SessionContext != nil {
+				_, _ = sb.WriteString(strconv.FormatInt(parsed.SessionContext.APIKeyID, 10))
+				_, _ = sb.WriteString("|")
+			}
+			_, _ = sb.WriteString(stableSeed)
+			hash := s.hashContent(sb.String())
+			slog.Info("sticky.hash_source",
+				"source", source,
+				"hash", hash,
+				"seed_len", len(stableSeed),
+			)
+			return hash
+		}
+		return ""
 	}
 
 	// 3. 最后 fallback: 使用 session上下文 + system + 所有消息的完整摘要串
@@ -794,12 +847,68 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 	return ""
 }
 
+func (s *GatewayService) hashStickySessionHint(parsed *ParsedRequest, sessionID, source string) (string, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "", false
+	}
+
+	var sb strings.Builder
+	if parsed != nil && parsed.SessionContext != nil {
+		_, _ = sb.WriteString(strconv.FormatInt(parsed.SessionContext.APIKeyID, 10))
+		_, _ = sb.WriteString("|")
+	}
+	_, _ = sb.WriteString(sessionID)
+	hash := s.hashContent(sb.String())
+	slog.Info("sticky.hash_source",
+		"source", source,
+		"hash", hash,
+	)
+	return hash, true
+}
+
+// isKiroGroup 判断请求所属分组是否为 Kiro 平台分组。
+func isKiroGroup(group *Group) bool {
+	return group != nil && group.Platform == PlatformKiro
+}
+
 // BindStickySession sets session -> account binding with standard TTL.
 func (s *GatewayService) BindStickySession(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
+	return s.BindStickySessionWithTTL(ctx, groupID, sessionHash, accountID, stickySessionTTL)
+}
+
+func (s *GatewayService) BindStickySessionForGroup(ctx context.Context, groupID *int64, sessionHash string, accountID int64, group *Group) error {
+	return s.BindStickySessionWithTTL(ctx, groupID, sessionHash, accountID, stickySessionTTLForGroup(group))
+}
+
+func (s *GatewayService) BindStickySessionWithTTL(ctx context.Context, groupID *int64, sessionHash string, accountID int64, ttl time.Duration) error {
 	if sessionHash == "" || accountID <= 0 || s.cache == nil {
 		return nil
 	}
-	return s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, accountID, stickySessionTTL)
+	if ttl <= 0 {
+		ttl = stickySessionTTL
+	}
+	return s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, accountID, ttl)
+}
+
+func stickySessionTTLForGroup(group *Group) time.Duration {
+	if group != nil && group.Platform == PlatformKiro {
+		return group.EffectiveKiroStickySessionTTL()
+	}
+	return stickySessionTTL
+}
+
+func (s *GatewayService) stickySessionTTLForGroupID(ctx context.Context, groupID *int64) time.Duration {
+	resolvedGroupID := derefGroupID(groupID)
+	if group := s.groupFromContext(ctx, resolvedGroupID); group != nil {
+		return stickySessionTTLForGroup(group)
+	}
+	if groupID != nil && s.groupRepo != nil {
+		if group, err := s.groupRepo.GetByIDLite(ctx, *groupID); err == nil {
+			return stickySessionTTLForGroup(group)
+		}
+	}
+	return stickySessionTTL
 }
 
 // GetCachedSessionAccountID retrieves the account ID bound to a sticky session.
@@ -937,6 +1046,41 @@ func appendMessageTextsFromRaw(builder *strings.Builder, raw []byte) {
 		}
 		return true
 	})
+}
+
+func extractFirstUserMessageTextFromRaw(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	messages := parseRawJSONView(raw)
+	if !messages.IsArray() {
+		return ""
+	}
+	var firstText string
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		role := strings.ToLower(strings.TrimSpace(msg.Get("role").String()))
+		if role != "" && role != "user" {
+			return true
+		}
+		if content := msg.Get("content"); content.Exists() {
+			firstText = extractTextFromContentRaw(content)
+		}
+		if firstText == "" {
+			parts := msg.Get("parts")
+			if parts.IsArray() {
+				var builder strings.Builder
+				parts.ForEach(func(_, part gjson.Result) bool {
+					if text := part.Get("text").String(); text != "" {
+						_, _ = builder.WriteString(text)
+					}
+					return true
+				})
+				firstText = builder.String()
+			}
+		}
+		return strings.TrimSpace(firstText) == ""
+	})
+	return strings.TrimSpace(firstText)
 }
 
 func extractCacheableTextFromSystemRaw(raw []byte) string {
@@ -1921,7 +2065,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 							continue
 						}
 						if sessionHash != "" && s.cache != nil {
-							_ = s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, item.account.ID, stickySessionTTL)
+							_ = s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, item.account.ID, s.stickySessionTTLForGroupID(ctx, groupID))
 						}
 						if s.debugModelRoutingEnabled() {
 							logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] routed select: group_id=%v model=%s session=%s account=%d", derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), item.account.ID)
@@ -2012,7 +2156,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 								"result", "slot_acquired",
 							)
 							if s.cache != nil {
-								_ = s.cache.RefreshSessionTTL(ctx, derefGroupID(groupID), sessionHash, stickySessionTTL)
+								_ = s.cache.RefreshSessionTTL(ctx, derefGroupID(groupID), sessionHash, s.stickySessionTTLForGroupID(ctx, groupID))
 							}
 							return s.newSelectionResult(ctx, account, true, result.ReleaseFunc, nil)
 						}
@@ -2171,7 +2315,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					result.ReleaseFunc() // 释放槽位，继续尝试下一个账号
 				} else {
 					if sessionHash != "" && s.cache != nil {
-						_ = s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.account.ID, stickySessionTTL)
+						_ = s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.account.ID, s.stickySessionTTLForGroupID(ctx, groupID))
 					}
 					return s.newSelectionResult(ctx, selected.account, true, result.ReleaseFunc, nil)
 				}
@@ -2219,7 +2363,7 @@ func (s *GatewayService) tryAcquireByLegacyOrder(ctx context.Context, candidates
 				continue
 			}
 			if sessionHash != "" && s.cache != nil {
-				_ = s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, acc.ID, stickySessionTTL)
+				_ = s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, acc.ID, s.stickySessionTTLForGroupID(ctx, groupID))
 			}
 			selection, err := s.newSelectionResult(ctx, acc, true, result.ReleaseFunc, nil)
 			if err != nil {
@@ -2382,14 +2526,16 @@ func (s *GatewayService) listSchedulableAccounts(ctx context.Context, groupID *i
 				"platform", platform,
 				"use_mixed", useMixed,
 				"count", len(accounts))
-			for _, acc := range accounts {
-				slog.Debug("account_scheduling_account_detail",
-					"account_id", acc.ID,
-					"name", acc.Name,
-					"platform", acc.Platform,
-					"type", acc.Type,
-					"status", acc.Status,
-					"tls_fingerprint", acc.IsTLSFingerprintEnabled())
+			if slog.Default().Enabled(ctx, slog.LevelDebug) {
+				for _, acc := range accounts {
+					slog.Debug("account_scheduling_account_detail",
+						"account_id", acc.ID,
+						"name", acc.Name,
+						"platform", acc.Platform,
+						"type", acc.Type,
+						"status", acc.Status,
+						"tls_fingerprint", acc.IsTLSFingerprintEnabled())
+				}
 			}
 		}
 		return accounts, useMixed, err
@@ -2425,14 +2571,16 @@ func (s *GatewayService) listSchedulableAccounts(ctx context.Context, groupID *i
 			"platform", platform,
 			"raw_count", len(accounts),
 			"filtered_count", len(filtered))
-		for _, acc := range filtered {
-			slog.Debug("account_scheduling_account_detail",
-				"account_id", acc.ID,
-				"name", acc.Name,
-				"platform", acc.Platform,
-				"type", acc.Type,
-				"status", acc.Status,
-				"tls_fingerprint", acc.IsTLSFingerprintEnabled())
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			for _, acc := range filtered {
+				slog.Debug("account_scheduling_account_detail",
+					"account_id", acc.ID,
+					"name", acc.Name,
+					"platform", acc.Platform,
+					"type", acc.Type,
+					"status", acc.Status,
+					"tls_fingerprint", acc.IsTLSFingerprintEnabled())
+			}
 		}
 		return filtered, useMixed, nil
 	}
@@ -2458,14 +2606,16 @@ func (s *GatewayService) listSchedulableAccounts(ctx context.Context, groupID *i
 		"group_id", derefGroupID(groupID),
 		"platform", platform,
 		"count", len(accounts))
-	for _, acc := range accounts {
-		slog.Debug("account_scheduling_account_detail",
-			"account_id", acc.ID,
-			"name", acc.Name,
-			"platform", acc.Platform,
-			"type", acc.Type,
-			"status", acc.Status,
-			"tls_fingerprint", acc.IsTLSFingerprintEnabled())
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		for _, acc := range accounts {
+			slog.Debug("account_scheduling_account_detail",
+				"account_id", acc.ID,
+				"name", acc.Name,
+				"platform", acc.Platform,
+				"type", acc.Type,
+				"status", acc.Status,
+				"tls_fingerprint", acc.IsTLSFingerprintEnabled())
+		}
 	}
 	return accounts, useMixed, nil
 }
@@ -3347,7 +3497,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 
 		if selected != nil {
 			if sessionHash != "" && s.cache != nil {
-				if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, stickySessionTTL); err != nil {
+				if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, s.stickySessionTTLForGroupID(ctx, groupID)); err != nil {
 					logger.LegacyPrintf("service.gateway", "set session account failed: session=%s account_id=%d err=%v", sessionHash, selected.ID, err)
 				}
 			}
@@ -3473,7 +3623,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 
 	// 4. 建立粘性绑定
 	if sessionHash != "" && s.cache != nil {
-		if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, stickySessionTTL); err != nil {
+		if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, s.stickySessionTTLForGroupID(ctx, groupID)); err != nil {
 			logger.LegacyPrintf("service.gateway", "set session account failed: session=%s account_id=%d err=%v", sessionHash, selected.ID, err)
 		}
 	}
@@ -3611,7 +3761,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 
 		if selected != nil {
 			if sessionHash != "" && s.cache != nil {
-				if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, stickySessionTTL); err != nil {
+				if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, s.stickySessionTTLForGroupID(ctx, groupID)); err != nil {
 					logger.LegacyPrintf("service.gateway", "set session account failed: session=%s account_id=%d err=%v", sessionHash, selected.ID, err)
 				}
 			}
@@ -3734,7 +3884,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 
 	// 4. 建立粘性绑定
 	if sessionHash != "" && s.cache != nil {
-		if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, stickySessionTTL); err != nil {
+		if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, selected.ID, s.stickySessionTTLForGroupID(ctx, groupID)); err != nil {
 			logger.LegacyPrintf("service.gateway", "set session account failed: session=%s account_id=%d err=%v", sessionHash, selected.ID, err)
 		}
 	}
@@ -4604,7 +4754,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 	// Web Search 模拟：纯 web_search 请求时，直接调用搜索 API 构造响应。
 	// Kiro OAuth 在 forwardKiroMessages 内部完成模型映射后再判断，避免使用未映射的请求体。
-	if account != nil && (account.Platform != PlatformKiro || account.Type != AccountTypeOAuth) && s.shouldEmulateWebSearch(ctx, account, parsed.GroupID, parsed.Body) {
+	if account != nil && (account.Platform != PlatformKiro || account.Type != AccountTypeOAuth) && s.shouldEmulateWebSearch(ctx, account, parsed.GroupID, parsed.Body.Bytes()) {
 		return s.handleWebSearchEmulation(ctx, c, account, parsed)
 	}
 
@@ -5613,6 +5763,9 @@ func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 		setHeaderRaw(req.Header, "anthropic-version", "2023-06-01")
 	}
 
+	// 账号级自定义请求头（最后应用，覆盖同名 header）
+	applyAccountCustomHeaders(req, account)
+
 	return req, body, nil
 }
 
@@ -5993,15 +6146,24 @@ func writeAnthropicPassthroughResponseHeaders(dst http.Header, src http.Header, 
 }
 
 // ApplyBedrockCCCompat 应用 Bedrock CC 兼容转换（渠道级模型映射后调用）
-// 清理 Anthropic API 专有字段、注入 Bedrock 必需字段、修复 thinking/tool_use ID
-func (s *GatewayService) ApplyBedrockCCCompat(ctx context.Context, body []byte, model string, account *Account, groupID *int64) []byte {
-	if !s.isBedrockCCCompatEnabled(ctx, account, groupID) {
+// 清理 body 中 Anthropic API 专有字段、修复 thinking/tool_use ID、过滤 beta token，
+// 同时过滤 HTTP header 中的 anthropic-beta（防止 Passthrough 路径透传不支持的 token）。
+func (s *GatewayService) ApplyBedrockCCCompat(c *gin.Context, body []byte, model string, account *Account, groupID *int64) []byte {
+	if !s.isBedrockCCCompatEnabled(c.Request.Context(), account, groupID) {
 		return body
 	}
 	body = sanitizeBedrockCCFields(body)
 	body = sanitizeBedrockThinking(body, model)
 	body = sanitizeBedrockToolUseIDs(body)
 	body = sanitizeBedrockCCBetaTokens(body, model)
+	// 过滤 HTTP header 中的 anthropic-beta，只保留 Bedrock 支持的 token
+	if betaHeader := c.GetHeader("anthropic-beta"); betaHeader != "" {
+		if filtered := ResolveBedrockBetaTokens(betaHeader, body, model); len(filtered) > 0 {
+			c.Request.Header.Set("anthropic-beta", strings.Join(filtered, ", "))
+		} else {
+			c.Request.Header.Del("anthropic-beta")
+		}
+	}
 	return body
 }
 
@@ -6387,7 +6549,7 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	if account.Type == AccountTypeAPIKey {
 		baseURL := account.GetBaseURL()
 		if baseURL == "" && account.Platform == PlatformKiro {
-			return nil, fmt.Errorf("kiro api key account requires base_url")
+			return nil, nil, fmt.Errorf("kiro api key account requires base_url")
 		}
 		if baseURL != "" {
 			validatedURL, err := s.validateUpstreamBaseURL(baseURL)
@@ -7508,6 +7670,8 @@ func (s *GatewayService) handleErrorResponse(ctx context.Context, resp *http.Res
 		return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: body}
 	}
 
+	MarkResponseCommitted(c)
+
 	// 记录上游错误响应体摘要便于排障（可选：由配置控制；不回显到客户端）
 	if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
 		logger.LegacyPrintf("service.gateway",
@@ -7631,6 +7795,7 @@ func (s *GatewayService) handleFailoverSideEffects(ctx context.Context, resp *ht
 // OAuth 403：标记账号异常
 // API Key 未配置错误码：仅返回错误，不标记账号
 func (s *GatewayService) handleRetryExhaustedError(ctx context.Context, resp *http.Response, c *gin.Context, account *Account) (*ForwardResult, error) {
+	MarkResponseCommitted(c)
 	// Capture upstream error body before side-effects consume the stream.
 	respBody, _ := s.readUpstreamErrorBody(resp)
 	_ = resp.Body.Close()

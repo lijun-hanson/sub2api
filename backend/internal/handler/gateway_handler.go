@@ -36,6 +36,30 @@ const gatewayCompatibilityMetricsLogInterval = 1024
 
 var gatewayCompatibilityMetricsLogCounter atomic.Uint64
 
+var stickySessionHeaderNames = []string{
+	"X-Session-ID",
+	"Anthropic-Session-Id",
+	"X-Claude-Code-Session-Id",
+	"X-OpenCode-Session",
+	"X-Session-Affinity",
+	"X-Conversation-ID",
+	"Session-Id",
+	"session_id",
+	"conversation_id",
+}
+
+func explicitStickySessionIDFromHeaders(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	for _, name := range stickySessionHeaderNames {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // GatewayHandler handles API gateway requests
 type GatewayHandler struct {
 	gatewayService            *service.GatewayService
@@ -273,6 +297,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		APIKeyID:  apiKey.ID,
 		UserID:    subject.UserID,
 	}
+
+	// 优先从 HTTP 请求头提取显式 Session ID，作为粘性会话最高优先级标识。
+	// 写入独立字段 ExplicitSessionID（不污染 metadata.user_id，后者还用于客户端亲和调度），
+	// 让 Kiro 等分组的客户端可以显式传递稳定 session 标识符，避免依赖请求体内容 hash。
+	parsedReq.ExplicitSessionID = explicitStickySessionIDFromHeaders(c)
+
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 
 	// [DEBUG-STICKY] 打印会话 hash 生成结果
@@ -427,7 +457,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 				// Slot acquired: no longer waiting in queue.
 				releaseWait()
-				if err := h.gatewayService.BindStickySession(c.Request.Context(), apiKey.GroupID, sessionKey, account.ID); err != nil {
+				if err := h.gatewayService.BindStickySessionForGroup(c.Request.Context(), apiKey.GroupID, sessionKey, account.ID, apiKey.Group); err != nil {
 					reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				}
 			}
@@ -479,12 +509,17 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						return
 					}
 				}
-				wroteFallback := h.ensureForwardErrorResponse(c, streamStarted)
+				upstreamErrorAlreadyCommunicated := gatewayForwardErrorAlreadyCommunicated(c, writerSizeBeforeForward, err)
+				wroteFallback := false
+				if !upstreamErrorAlreadyCommunicated {
+					wroteFallback = h.ensureForwardErrorResponse(c, streamStarted)
+				}
 				forwardFailedFields := []zap.Field{
 					zap.Int64("account_id", account.ID),
 					zap.String("account_name", account.Name),
 					zap.String("account_platform", account.Platform),
 					zap.Bool("fallback_error_response_written", wroteFallback),
+					zap.Bool("upstream_error_response_already_written", upstreamErrorAlreadyCommunicated),
 					zap.Error(err),
 				}
 				if account.Proxy != nil {
@@ -704,7 +739,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					zap.String("session_key", sessionKey),
 					zap.Int64("account_id", account.ID),
 				)
-				if err := h.gatewayService.BindStickySession(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID); err != nil {
+				if err := h.gatewayService.BindStickySessionForGroup(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID, currentAPIKey.Group); err != nil {
 					reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				}
 			}
@@ -771,8 +806,8 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 			}
-			// Bedrock CC 兼容：渠道模型映射后，清理 Anthropic API 专有字段、注入 Bedrock 必需字段
-			if err := attemptParsedReq.ReplaceBody(h.gatewayService.ApplyBedrockCCCompat(c.Request.Context(), attemptParsedReq.Body.Bytes(), attemptParsedReq.Model, account, apiKey.GroupID)); err != nil {
+			// Bedrock CC 兼容：清理 body 专有字段 + 过滤 anthropic-beta header，适用于所有转发路径
+			if err := attemptParsedReq.ReplaceBody(h.gatewayService.ApplyBedrockCCCompat(c, attemptParsedReq.Body.Bytes(), attemptParsedReq.Model, account, apiKey.GroupID)); err != nil {
 				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 				return
 			}
@@ -876,12 +911,17 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						return
 					}
 				}
-				wroteFallback := h.ensureForwardErrorResponse(c, streamStarted)
+				upstreamErrorAlreadyCommunicated := gatewayForwardErrorAlreadyCommunicated(c, writerSizeBeforeForward, err)
+				wroteFallback := false
+				if !upstreamErrorAlreadyCommunicated {
+					wroteFallback = h.ensureForwardErrorResponse(c, streamStarted)
+				}
 				forwardFailedFields := []zap.Field{
 					zap.Int64("account_id", account.ID),
 					zap.String("account_name", account.Name),
 					zap.String("account_platform", account.Platform),
 					zap.Bool("fallback_error_response_written", wroteFallback),
+					zap.Bool("upstream_error_response_already_written", upstreamErrorAlreadyCommunicated),
 					zap.Error(err),
 				}
 				if account.Proxy != nil {
@@ -913,7 +953,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// - 粘性账号因负载/RPM 被跳过、选中了其他账号：不覆盖原绑定，
 			//   下次请求粘性账号恢复后仍可命中
 			if sessionKey != "" && (sessionBoundAccountID == 0 || sessionBoundAccountID == account.ID) {
-				if err := h.gatewayService.BindStickySession(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID); err != nil {
+				if err := h.gatewayService.BindStickySessionForGroup(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID, currentAPIKey.Group); err != nil {
 					reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				}
 			}
@@ -1607,11 +1647,39 @@ func (h *GatewayHandler) ensureForwardErrorResponse(c *gin.Context, streamStarte
 	if c == nil || c.Writer == nil {
 		return false
 	}
+	if service.IsResponseCommitted(c) {
+		return false
+	}
 	if c.Writer.Written() {
 		streamStarted = true
 	}
 	h.handleStreamingAwareError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed", streamStarted)
 	return true
+}
+
+// gatewayForwardErrorAlreadyCommunicated reports whether a Forward implementation
+// has already written a complete error response to the client before returning
+// an error to the handler.
+//
+// This is intentionally narrower than "writer size changed": a stream may have
+// only emitted keepalive pings or partial data, in which case the handler still
+// needs to append a protocol-level terminal error. Non-SSE output from Forward
+// is different: service-level helpers such as handleErrorResponse/writeClaudeError
+// already wrote the client-visible JSON body, so adding the generic streaming
+// fallback would corrupt the response by appending a second `data: ...` frame.
+func gatewayForwardErrorAlreadyCommunicated(c *gin.Context, writerSizeBeforeForward int, err error) bool {
+	if err == nil || c == nil || c.Writer == nil {
+		return false
+	}
+	if c.Writer.Size() == writerSizeBeforeForward {
+		return false
+	}
+
+	contentType := strings.ToLower(strings.TrimSpace(c.Writer.Header().Get("Content-Type")))
+	if contentType == "" {
+		return false
+	}
+	return !strings.Contains(contentType, "text/event-stream")
 }
 
 // checkClaudeCodeVersion 检查 Claude Code 客户端版本是否满足版本要求
@@ -1753,6 +1821,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 		APIKeyID:  apiKey.ID,
 		UserID:    subject.UserID,
 	}
+	parsedReq.ExplicitSessionID = explicitStickySessionIDFromHeaders(c)
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 
 	// 选择支持该模型的账号

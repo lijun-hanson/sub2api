@@ -97,7 +97,6 @@ export default {
       claude: 'Claude',
       gemini: 'Gemini',
       antigravity: 'Antigravity',
-      kiro: 'Kiro',
       more: '更多'
     },
     // CTA 区块
@@ -343,6 +342,34 @@ export default {
         withSuffix: '{time} 后解除'
       }
     }
+  },
+
+  adminCompliance: {
+    title: '部署与运营合规确认',
+    blockingNotice: '继续使用控制台前，须完成部署与运营合规确认。',
+    riskNotice: '本确认用于以清晰、显著、可留痕的方式提示自部署实例的合规义务与运营风险。',
+    version: '协议版本',
+    openDocument: '在 GitHub 查看协议文件',
+    documentSource: '协议正文来自本项目仓库中的 Markdown 文件。修改协议内容时必须同步递增协议版本；已确认的旧版本将失效，控制台使用者须重新确认。',
+    inputLabel: '请逐字输入以下确认短语',
+    inputPlaceholder: '输入确认短语以继续',
+    inputMismatch: '确认短语不匹配，请逐字输入提示内容。',
+    legalNote: '本确认用于明确自部署实例与开源项目、著作权人、贡献者及维护者之间的非关联关系和责任边界；部署、运营或控制相关实例的主体应独立承担其适用义务。',
+    logout: '退出登录',
+    accept: '确认并继续',
+    accepted: '合规确认已记录',
+    acceptFailed: '提交确认失败'
+  },
+
+  legal: {
+    loadFailed: '文档加载失败',
+    retryLater: '请稍后刷新页面重试。',
+    notFound: '文档不存在',
+    notFoundDescription: '当前条款文档不存在或已被管理员移除。',
+    updatedAt: '更新日期：{date}',
+    empty: '暂无正文内容',
+    loginAgreement: '登录条款',
+    adminCompliance: '部署与运营合规承诺'
   },
 
   // Navigation
@@ -861,6 +888,8 @@ export default {
     accountCost: '成本',
     userBilled: '用户扣费',
     accountBilled: '账号计费',
+    resetNow: '现在',
+    resetPending: '待刷新',
     accountMultiplier: '账号倍率',
     avgDuration: '平均耗时',
     inSelectedRange: '所选范围内',
@@ -901,6 +930,9 @@ export default {
     unknown: '未知',
     in: '输入',
     out: '输出',
+    cacheHit: '缓存命中',
+    cacheCreate: '缓存创建',
+    cacheHitRate: '缓存命中率',
     inputTokenPrice: '输入单价',
     outputTokenPrice: '输出单价',
     perMillionTokens: '/ 1M Token',
@@ -1816,6 +1848,16 @@ export default {
       allGroups: '全部分组',
       searchGroups: '搜索分组...',
       fuzzySearch: '模糊搜索',
+      apiKeyGroupFilter: 'API Key 分组',
+      apiKeyGroupExclusive: '专用分组',
+      apiKeyGroupPublic: '公开分组',
+      apiKeyGroupSubscription: '订阅分组',
+      apiKeyGroupDisabled: '已禁用分组',
+      authorizedGroupFilter: '授权分组',
+      allAuthorizedGroups: '全部授权分组',
+      searchAuthorizedGroups: '搜索授权分组...',
+      allApiKeyGroups: '全部 API Key 分组',
+      searchApiKeyGroups: '搜索 API Key 分组...',
       statusFilter: '状态筛选',
       allStatuses: '全部状态',
       admin: '管理员',
@@ -2281,7 +2323,11 @@ export default {
         description: '仅对当前 Kiro 分组模拟 Anthropic Prompt Cache 用量。',
         enabled: '启用模拟缓存',
         ratio: '缓存比例',
-        ratioHint: '范围 0 到 1，例如 0.5 表示只生效一半模拟缓存 token。'
+        ratioHint: '范围 0 到 1，例如 0.5 表示只生效一半模拟缓存 token。',
+        stickyRouting: '启用 Kiro 账号粘性路由',
+        stickyRoutingHint: '开启后，同一会话的多轮对话会尽量固定到同一账号；请求头传 X-Session-ID 时仍优先使用显式会话绑定。',
+        stickyTTL: '粘性绑定时长（秒）',
+        stickyTTLHint: '同一会话空闲超过该时长后会重新选择账号。范围 60-86400，默认 3600。'
       },
       imagePricing: {
         title: '图片生成计费',
@@ -3476,6 +3522,11 @@ export default {
       recoverStateHint: '用于恢复错误、限流和临时不可调度等可恢复状态。',
       recoverStateSuccess: '账号状态已恢复',
       recoverStateFailed: '恢复账号状态失败',
+      fallbackActive: '已回退',
+      fallbackActiveTip: '原代理 {origin} 已到期，当前使用备用代理',
+      revertProxy: '切回原代理',
+      revertProxySuccess: '已成功切回原代理',
+      revertProxyFailed: '切回原代理失败',
       resetStatus: '重置状态',
       statusReset: '账号状态已重置',
       failedToResetStatus: '重置账号状态失败',
@@ -4311,9 +4362,6 @@ export default {
       createProxy: '添加代理',
       editProxy: '编辑代理',
       deleteProxy: '删除代理',
-      ad: {
-        inline: '正在寻找合适的代理 IP？'
-      },
       deleteConfirmMessage: "确定要删除代理 '{name}' 吗？",
       testProxy: '测试代理',
       dataImport: '导入',
@@ -4346,6 +4394,8 @@ export default {
         status: '状态',
         accounts: '账号数',
         latency: '延迟',
+        expiry: '有效期',
+        createdAt: '创建时间',
         actions: '操作',
         nameLabel: '名称',
         namePlaceholder: '请输入代理名称',
@@ -4481,7 +4531,21 @@ export default {
       nameRequired: '请输入代理名称',
       hostRequired: '请输入主机地址',
       portInvalid: '端口必须在 1-65535 之间',
-      deleteConfirm: "确定要删除代理 '{name}' 吗？使用此代理的账号将被移除代理设置。"
+      deleteConfirm: "确定要删除代理 '{name}' 吗？使用此代理的账号将被移除代理设置。",
+      neverExpires: '永不过期',
+      expired: '已过期',
+      overdueDays: '已超期 {days} 天',
+      expiringInDays: '{days} 天后到期',
+      remainingDays: '剩余 {days} 天',
+      expiresAt: '有效期',
+      nDays: '{days} 天',
+      expiryDaysPlaceholder: '自定义天数，留空 = 永不过期',
+      expiryWarnDays: '到期提醒提前天数',
+      fallbackMode: '失败回退',
+      fallbackNone: '不回退',
+      fallbackProxy: '指定备用代理',
+      fallbackDirect: '回退直连',
+      backupProxy: '备用代理',
     },
 
     // Redeem Codes Management
@@ -5274,6 +5338,7 @@ export default {
           accountRateLimitedCount: '限流账号数',
           accountErrorCount: '错误账号数（不含临时不可调度）',
           accountErrorRatio: '错误账号比例 (%)',
+          accountTempUnscheduledCount: '临时不可调度账号数',
           overloadAccountCount: '过载账号数'
         },
         metricDescriptions: {
@@ -5291,6 +5356,7 @@ export default {
           accountRateLimitedCount: '统计窗口内被限流的账号数量。',
           accountErrorCount: '统计窗口内产生错误的账号数量（不含临时不可调度）。',
           accountErrorRatio: '统计窗口内错误账号占比（0~100）。',
+          accountTempUnscheduledCount: '当前处于临时不可调度状态的账号数量（如代理/凭据故障被自动摘除）。',
           overloadAccountCount: '统计窗口内过载账号数量。'
         },
         hints: {

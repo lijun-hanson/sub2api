@@ -91,6 +91,10 @@ type Group struct {
 	RpmLimit int `json:"rpm_limit,omitempty"`
 	// 是否启用 Kiro 模拟缓存（仅 kiro 分组生效）
 	KiroCacheEmulationEnabled bool `json:"kiro_cache_emulation_enabled,omitempty"`
+	// 是否启用 Kiro 自动会话粘性路由（仅 kiro 分组生效）
+	KiroAutoStickyEnabled bool `json:"kiro_auto_sticky_enabled,omitempty"`
+	// Kiro 自动会话粘性绑定 TTL（秒，仅 kiro 分组生效）
+	KiroStickySessionTTLSeconds int `json:"kiro_sticky_session_ttl_seconds,omitempty"`
 	// Kiro 模拟缓存生效比例，范围 0-1（仅 kiro 分组生效）
 	KiroCacheEmulationRatio float64 `json:"kiro_cache_emulation_ratio,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
@@ -201,11 +205,11 @@ func (*Group) scanValues(columns []string) ([]any, error) {
 		switch columns[i] {
 		case group.FieldModelRouting, group.FieldSupportedModelScopes, group.FieldMessagesDispatchModelConfig, group.FieldModelsListConfig:
 			values[i] = new([]byte)
-		case group.FieldIsExclusive, group.FieldAllowImageGeneration, group.FieldImageRateIndependent, group.FieldClaudeCodeOnly, group.FieldModelRoutingEnabled, group.FieldMcpXMLInject, group.FieldAllowMessagesDispatch, group.FieldRequireOauthOnly, group.FieldRequirePrivacySet, group.FieldKiroCacheEmulationEnabled:
+		case group.FieldIsExclusive, group.FieldAllowImageGeneration, group.FieldImageRateIndependent, group.FieldClaudeCodeOnly, group.FieldModelRoutingEnabled, group.FieldMcpXMLInject, group.FieldAllowMessagesDispatch, group.FieldRequireOauthOnly, group.FieldRequirePrivacySet, group.FieldKiroCacheEmulationEnabled, group.FieldKiroAutoStickyEnabled:
 			values[i] = new(sql.NullBool)
 		case group.FieldRateMultiplier, group.FieldDailyLimitUsd, group.FieldWeeklyLimitUsd, group.FieldMonthlyLimitUsd, group.FieldImageRateMultiplier, group.FieldImagePrice1k, group.FieldImagePrice2k, group.FieldImagePrice4k, group.FieldKiroCacheEmulationRatio:
 			values[i] = new(sql.NullFloat64)
-		case group.FieldID, group.FieldDefaultValidityDays, group.FieldFallbackGroupID, group.FieldFallbackGroupIDOnInvalidRequest, group.FieldSortOrder, group.FieldRpmLimit:
+		case group.FieldID, group.FieldDefaultValidityDays, group.FieldFallbackGroupID, group.FieldFallbackGroupIDOnInvalidRequest, group.FieldSortOrder, group.FieldRpmLimit, group.FieldKiroStickySessionTTLSeconds:
 			values[i] = new(sql.NullInt64)
 		case group.FieldName, group.FieldDescription, group.FieldStatus, group.FieldPlatform, group.FieldSubscriptionType, group.FieldDefaultMappedModel:
 			values[i] = new(sql.NullString)
@@ -466,6 +470,18 @@ func (_m *Group) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.KiroCacheEmulationEnabled = value.Bool
 			}
+		case group.FieldKiroAutoStickyEnabled:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field kiro_auto_sticky_enabled", values[i])
+			} else if value.Valid {
+				_m.KiroAutoStickyEnabled = value.Bool
+			}
+		case group.FieldKiroStickySessionTTLSeconds:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field kiro_sticky_session_ttl_seconds", values[i])
+			} else if value.Valid {
+				_m.KiroStickySessionTTLSeconds = int(value.Int64)
+			}
 		case group.FieldKiroCacheEmulationRatio:
 			if value, ok := values[i].(*sql.NullFloat64); !ok {
 				return fmt.Errorf("unexpected type %T for field kiro_cache_emulation_ratio", values[i])
@@ -675,6 +691,12 @@ func (_m *Group) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("kiro_cache_emulation_enabled=")
 	builder.WriteString(fmt.Sprintf("%v", _m.KiroCacheEmulationEnabled))
+	builder.WriteString(", ")
+	builder.WriteString("kiro_auto_sticky_enabled=")
+	builder.WriteString(fmt.Sprintf("%v", _m.KiroAutoStickyEnabled))
+	builder.WriteString(", ")
+	builder.WriteString("kiro_sticky_session_ttl_seconds=")
+	builder.WriteString(fmt.Sprintf("%v", _m.KiroStickySessionTTLSeconds))
 	builder.WriteString(", ")
 	builder.WriteString("kiro_cache_emulation_ratio=")
 	builder.WriteString(fmt.Sprintf("%v", _m.KiroCacheEmulationRatio))

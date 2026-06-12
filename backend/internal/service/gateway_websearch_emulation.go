@@ -194,8 +194,9 @@ func (s *GatewayService) handleWebSearchEmulation(
 	if model == "" {
 		model = defaultWebSearchModel
 	}
-	inputTokens := estimateKiroInputTokens(parsed.Body)
-	cacheUsage := s.buildKiroCacheEmulationUsage(account, parsed.Group, parsed.Body, model, inputTokens)
+	body := parsed.Body.Bytes()
+	inputTokens := estimateKiroInputTokens(body)
+	cacheUsage := s.buildKiroCacheEmulationUsage(account, parsed.Group, body, model, inputTokens)
 
 	if parsed.Stream {
 		return writeWebSearchStreamResponse(c, query, resp, model, startTime, inputTokens, cacheUsage)
