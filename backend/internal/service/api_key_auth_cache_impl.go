@@ -14,7 +14,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 13 // v13: reload snapshots for Kiro auto sticky routing switch
+const apiKeyAuthSnapshotVersion = 14 // v14: merge Kiro auto sticky routing + group peak rate fields
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -286,6 +286,10 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			KiroAutoStickyEnabled:           groupForSnapshot.EffectiveKiroAutoStickyEnabled(),
 			KiroStickySessionTTLSeconds:     groupForSnapshot.EffectiveKiroStickySessionTTLSeconds(),
 			KiroCacheEmulationRatio:         groupForSnapshot.EffectiveKiroCacheEmulationRatio(),
+			PeakRateEnabled:                 groupForSnapshot.PeakRateEnabled,
+			PeakStart:                       groupForSnapshot.PeakStart,
+			PeakEnd:                         groupForSnapshot.PeakEnd,
+			PeakRateMultiplier:              groupForSnapshot.PeakRateMultiplier,
 		}
 	}
 	return snapshot
@@ -363,6 +367,10 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			KiroAutoStickyEnabled:           snapshot.Group.KiroAutoStickyEnabled,
 			KiroStickySessionTTLSeconds:     snapshot.Group.KiroStickySessionTTLSeconds,
 			KiroCacheEmulationRatio:         snapshot.Group.KiroCacheEmulationRatio,
+			PeakRateEnabled:                 snapshot.Group.PeakRateEnabled,
+			PeakStart:                       snapshot.Group.PeakStart,
+			PeakEnd:                         snapshot.Group.PeakEnd,
+			PeakRateMultiplier:              snapshot.Group.PeakRateMultiplier,
 		}
 		normalizeKiroCacheEmulationFields(apiKey.Group)
 	}
