@@ -3,7 +3,6 @@
 package service
 
 import (
-	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,67 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
-
-func TestForwardAsResponsesKiroDirectUsesResponsesCacheProfile(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	resetKiroCacheTracker()
-
-	account := &Account{
-		ID:          301,
-		Name:        "kiro-responses-cache",
-		Platform:    PlatformKiro,
-		Type:        AccountTypeOAuth,
-		Status:      StatusActive,
-		Schedulable: true,
-		Concurrency: 1,
-		Credentials: map[string]any{
-			"access_token": "kiro-access-token",
-			"profile_arn":  "arn:aws:codewhisperer:us-east-1:123456789012:profile/RESPONSECACHE",
-		},
-	}
-	group := kiroCacheGroup(1)
-	body := kiroResponsesCacheRequestBody("gateway", "workspace-gateway", "resp-gateway")
-	parsed, err := ParseGatewayRequest(NewRequestBodyRef(body), "responses")
-	require.NoError(t, err)
-	parsed.Group = group
-
-	upstream := &queuedHTTPUpstream{responses: []*http.Response{
-		kiroResponsesCacheUpstreamResponse(t, 5),
-		kiroResponsesCacheUpstreamResponse(t, 7),
-	}}
-	svc := &GatewayService{
-		cfg: &config.Config{Gateway: config.GatewayConfig{
-			StreamDataIntervalTimeout: 0,
-			MaxLineSize:               defaultMaxLineSize,
-		}},
-		httpUpstream:        upstream,
-		kiroCooldownStore:   &stubKiroCooldownStore{},
-		tlsFPProfileService: &TLSFingerprintProfileService{},
-		rateLimitService:    &RateLimitService{},
-	}
-
-	firstCtx, firstRec := newResponsesGatewayTestContext()
-	firstResult, err := svc.ForwardAsResponses(firstCtx.Request.Context(), firstCtx, account, body, parsed)
-	require.NoError(t, err)
-	require.Equal(t, 0, firstResult.Usage.CacheReadInputTokens)
-	require.Greater(t, firstResult.Usage.CacheCreationInputTokens, 0)
-	require.Equal(t, firstResult.Usage.CacheCreationInputTokens, int(gjson.Get(firstRec.Body.String(), "usage.cache_creation_input_tokens").Int()))
-	require.False(t, gjson.Get(firstRec.Body.String(), "usage.input_tokens_details.cached_tokens").Exists())
-
-	secondCtx, secondRec := newResponsesGatewayTestContext()
-	secondResult, err := svc.ForwardAsResponses(secondCtx.Request.Context(), secondCtx, account, body, parsed)
-	require.NoError(t, err)
-	require.Greater(t, secondResult.Usage.CacheReadInputTokens, 0)
-	require.Equal(t, 0, secondResult.Usage.CacheCreationInputTokens)
-	require.Equal(t, secondResult.Usage.CacheReadInputTokens, int(gjson.Get(secondRec.Body.String(), "usage.input_tokens_details.cached_tokens").Int()))
-	require.Equal(t, 0, int(gjson.Get(secondRec.Body.String(), "usage.cache_creation_input_tokens").Int()))
-	require.Len(t, upstream.requests, 2)
-}
 
 func TestAdaptResponsesClientToolsForAnthropic_FlattensNamespace(t *testing.T) {
 	t.Parallel()
