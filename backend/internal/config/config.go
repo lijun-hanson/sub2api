@@ -769,6 +769,16 @@ func (c *Config) TrustForwardedIPForAPIKeyACL() bool {
 	return c.ForwardedClientIPSettings().TrustForwardedIP
 }
 
+// DefaultAPIKeyQuotaCap returns the configured fallback USD quota applied to API
+// keys that carry no explicit quota of their own. 0 means "no default cap"
+// (unlimited). Nil-safe so billing/degraded paths can call it unconditionally.
+func (c *Config) DefaultAPIKeyQuotaCap() float64 {
+	if c == nil {
+		return 0
+	}
+	return c.Billing.DefaultAPIKeyQuota
+}
+
 // ForwardedClientIPTrustEnabled reports whether the legacy forwarded-header
 // compatibility mode currently overrides server.trusted_proxies.
 func (c *Config) ForwardedClientIPTrustEnabled() bool {
@@ -838,6 +848,12 @@ type BillingConfig struct {
 	// Requests in balance mode are rejected when the cached balance is below this
 	// amount, even if it is still positive. Set to 0 to keep the legacy balance > 0 gate.
 	MinimumBalanceReserve float64 `mapstructure:"minimum_balance_reserve"`
+	// DefaultAPIKeyQuota bounds the total USD spend of any API key that has no
+	// explicit quota of its own (Quota<=0). Once such a key's quota_used reaches
+	// this amount it is treated as exhausted and rejected at auth, capping the
+	// blast radius of a leaked/compromised key. 0 (default) keeps the legacy
+	// behavior where an unset key quota means unlimited.
+	DefaultAPIKeyQuota float64 `mapstructure:"default_api_key_quota"`
 	// UserPlatformQuotaCacheTTLSeconds 用户 × 平台 quota 缓存 TTL（秒），默认 86400=1天，覆盖典型 daily 窗口。
 	// 消费点：
 	//   - billing_cache_service.cacheWriteWorker 异步累加
@@ -1934,6 +1950,7 @@ func setDefaults() {
 	viper.SetDefault("billing.circuit_breaker.reset_timeout_seconds", 30)
 	viper.SetDefault("billing.circuit_breaker.half_open_requests", 3)
 	viper.SetDefault("billing.minimum_balance_reserve", 0.000001)
+	viper.SetDefault("billing.default_api_key_quota", 0.0)
 	viper.SetDefault("billing.user_platform_quota_cache_ttl_seconds", 86400)
 	viper.SetDefault("billing.user_platform_quota_sentinel_ttl_seconds", 3600)
 
@@ -2864,6 +2881,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Billing.MinimumBalanceReserve < 0 {
 		return fmt.Errorf("billing.minimum_balance_reserve must be non-negative")
+	}
+	if c.Billing.DefaultAPIKeyQuota < 0 {
+		return fmt.Errorf("billing.default_api_key_quota must be non-negative")
 	}
 	if c.Database.MaxOpenConns <= 0 {
 		return fmt.Errorf("database.max_open_conns must be positive")

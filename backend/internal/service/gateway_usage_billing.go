@@ -80,7 +80,8 @@ type postUsageBillingParams struct {
 	IsSubscriptionBill    bool
 	AccountRateMultiplier float64
 	APIKeyService         APIKeyQuotaUpdater
-	Platform              string // 来自 APIKey 关联 Group 的平台标识
+	Platform              string  // 来自 APIKey 关联 Group 的平台标识
+	DefaultAPIKeyQuota    float64 // 配置的默认 key 额度上限（key 自身未设额度时生效，0=不限）
 }
 
 // PlatformFromAPIKey 从 APIKey 关联的 Group 推导 platform 名称。
@@ -117,7 +118,9 @@ func QuotaPlatform(ctx context.Context, apiKey *APIKey) string {
 }
 
 func (p *postUsageBillingParams) shouldDeductAPIKeyQuota() bool {
-	return p.Cost.ActualCost > 0 && p.APIKey.Quota > 0 && p.APIKeyService != nil
+	// Track quota_used whenever an effective cap applies — the key's own quota or
+	// the configured default cap — so the default cap can actually trip at auth.
+	return p.Cost.ActualCost > 0 && p.APIKey.EffectiveQuota(p.DefaultAPIKeyQuota) > 0 && p.APIKeyService != nil
 }
 
 func (p *postUsageBillingParams) shouldUpdateRateLimits() bool {
@@ -778,6 +781,7 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 		AccountRateMultiplier: accountRateMultiplier,
 		APIKeyService:         input.APIKeyService,
 		Platform:              quotaPlatform,
+		DefaultAPIKeyQuota:    s.cfg.DefaultAPIKeyQuotaCap(),
 	}, s.billingDeps(), s.usageBillingRepo)
 
 	if billingErr != nil {

@@ -1629,6 +1629,11 @@ func TestValidateConfigErrors(t *testing.T) {
 			wantErr: "billing.minimum_balance_reserve",
 		},
 		{
+			name:    "billing default api key quota",
+			mutate:  func(c *Config) { c.Billing.DefaultAPIKeyQuota = -1 },
+			wantErr: "billing.default_api_key_quota",
+		},
+		{
 			name:    "database max open conns",
 			mutate:  func(c *Config) { c.Database.MaxOpenConns = 0 },
 			wantErr: "database.max_open_conns",

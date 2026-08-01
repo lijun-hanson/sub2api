@@ -160,7 +160,7 @@ func APIKeyAuthWithSubscriptionGoogle(apiKeyService *service.APIKeyService, subs
 			abortWithGoogleError(c, 403, "API key 已过期")
 			return
 		}
-		if apiKey.IsQuotaExhausted() {
+		if apiKey.IsQuotaExhaustedWithDefault(cfg.DefaultAPIKeyQuotaCap()) {
 			abortWithGoogleError(c, 429, "API key 额度已用完")
 			return
 		}

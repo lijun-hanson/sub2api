@@ -81,12 +81,33 @@ func (k *APIKey) IsExpired() bool {
 	return time.Now().After(*k.ExpiresAt)
 }
 
-// IsQuotaExhausted checks if the API key quota is exhausted
-func (k *APIKey) IsQuotaExhausted() bool {
-	if k.Quota <= 0 {
+// EffectiveQuota returns the USD quota cap that applies to this key: its own
+// explicit quota when set (>0), otherwise the supplied default cap for keys
+// that have none. A non-positive result means "unlimited".
+func (k *APIKey) EffectiveQuota(defaultCap float64) float64 {
+	if k.Quota > 0 {
+		return k.Quota
+	}
+	if defaultCap > 0 {
+		return defaultCap
+	}
+	return 0
+}
+
+// IsQuotaExhaustedWithDefault reports whether the key has reached its effective
+// quota — its own explicit quota, or the supplied default cap for keys without
+// one. Passing 0 preserves the legacy "unset quota == unlimited" behavior.
+func (k *APIKey) IsQuotaExhaustedWithDefault(defaultCap float64) bool {
+	limit := k.EffectiveQuota(defaultCap)
+	if limit <= 0 {
 		return false // unlimited
 	}
-	return k.QuotaUsed >= k.Quota
+	return k.QuotaUsed >= limit
+}
+
+// IsQuotaExhausted checks if the API key quota is exhausted (explicit quota only).
+func (k *APIKey) IsQuotaExhausted() bool {
+	return k.IsQuotaExhaustedWithDefault(0)
 }
 
 // GetQuotaRemaining returns remaining quota (-1 for unlimited)
