@@ -37,7 +37,10 @@ describe('native browser controls', () => {
   })
 
   it('does not use native browser dialog APIs in production source', () => {
-    const nativeDialogCall = /\b(?:window\.)?(?:alert|confirm|prompt)\s*\(/
+    // Require the explicit `window.` prefix: bare `prompt(`/`confirm(` also match
+    // legitimate local functions (e.g. useStepUp's `prompt()`) and translation
+    // strings (e.g. "Full prompt (unredacted)"), which are not native dialogs.
+    const nativeDialogCall = /\bwindow\.(?:alert|confirm|prompt)\s*\(/
     const offenders = productionSources.filter((path) =>
       nativeDialogCall.test(stripComments(readFileSync(path, 'utf8'))),
     )

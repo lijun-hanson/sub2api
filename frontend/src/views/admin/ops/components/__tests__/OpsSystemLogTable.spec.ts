@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 import OpsSystemLogTable from '../OpsSystemLogTable.vue'
+import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import enLocale from '@/i18n/locales/en'
 import zhLocale from '@/i18n/locales/zh'
 
@@ -121,6 +122,12 @@ describe('OpsSystemLogTable host support', () => {
     const cleanupButton = wrapper.findAll('button').find((button) => button.text() === 'admin.ops.systemLogs.cleanCurrentFilters')
     expect(cleanupButton).toBeDefined()
     await cleanupButton!.trigger('click')
+    await flushPromises()
+
+    // cleanup is gated behind a ConfirmDialog (teleported); confirm via the component
+    const cleanupDialog = wrapper.findAllComponents(ConfirmDialog).find((d) => d.props('show'))
+    expect(cleanupDialog).toBeDefined()
+    cleanupDialog!.vm.$emit('confirm')
     await flushPromises()
 
     expect(mockCleanupSystemLogs).toHaveBeenCalledWith(expect.objectContaining({ host: 'api-node-2' }))
