@@ -594,7 +594,7 @@ func kiroEndpointModeForRequest(account *Account, parsed *ParsedRequest) string 
 	return parsed.Group.EffectiveKiroEndpointMode()
 }
 
-func (s *GatewayService) buildKiroPayloadForAccount(ctx context.Context, account *Account, parsed *ParsedRequest, anthropicBody []byte, modelID, token, requestModel string, headers http.Header) (*kiropkg.KiroBuildResult, error) {
+func (s *GatewayService) buildKiroPayloadForAccount(ctx context.Context, account *Account, parsed *ParsedRequest, anthropicBody []byte, modelID, token, requestModel string, headers http.Header) (*kiropkg.KiroBuildResult, error) { //nolint:unused // exercised by //go:build unit tests (kiro_*_test.go)
 	var profileArn string
 	if kiroEndpointModeForRequest(account, parsed) == KiroEndpointModeKRS {
 		profileArn = kiroResolveProfileArnForKRS(account)

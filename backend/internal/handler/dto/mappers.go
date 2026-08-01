@@ -208,7 +208,7 @@ func groupFromServiceBase(g *service.Group) Group {
 		RequireOAuthOnly:                g.RequireOAuthOnly,
 		RequirePrivacySet:               g.RequirePrivacySet,
 		RPMLimit:                        g.RPMLimit,
-MaxReasoningEffort:              g.MaxReasoningEffort,
+		MaxReasoningEffort:              g.MaxReasoningEffort,
 		ReasoningEffortMappings:         g.ReasoningEffortMappings,
 		KiroCacheEmulationEnabled:       g.EffectiveKiroCacheEmulationEnabled(),
 		KiroAutoStickyEnabled:           g.EffectiveKiroAutoStickyEnabled(),

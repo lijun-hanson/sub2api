@@ -18,7 +18,7 @@ func kiroCreditsFromUsageGJSON(usage gjson.Result) float64 {
 	return 0
 }
 
-func (s *GatewayService) streamKeepaliveIntervalForAccount(account *Account) time.Duration {
+func (s *GatewayService) streamKeepaliveIntervalForAccount(account *Account) time.Duration { //nolint:unused // exercised by //go:build unit tests (kiro_alignment_unit_test.go)
 	if account != nil && account.Platform == PlatformKiro {
 		if s != nil && s.cfg != nil && s.cfg.Gateway.KiroStreamKeepaliveInterval > 0 {
 			return time.Duration(s.cfg.Gateway.KiroStreamKeepaliveInterval) * time.Second

@@ -981,7 +981,7 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		MessagesDispatchModelConfig:     g.MessagesDispatchModelConfig,
 		ModelsListConfig:                g.ModelsListConfig,
 		RPMLimit:                        g.RpmLimit,
-MaxReasoningEffort:              g.MaxReasoningEffort,
+		MaxReasoningEffort:              g.MaxReasoningEffort,
 		ReasoningEffortMappings:         g.ReasoningEffortMappings,
 		KiroCacheEmulationEnabled:       g.KiroCacheEmulationEnabled,
 		KiroAutoStickyEnabled:           g.KiroAutoStickyEnabled,
