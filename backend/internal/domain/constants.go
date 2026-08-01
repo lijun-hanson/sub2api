@@ -24,6 +24,7 @@ const (
 	PlatformAntigravity = "antigravity"
 	PlatformKiro        = "kiro"
 	PlatformGrok        = "grok"
+	PlatformComposite   = "composite"
 )
 
 // Account type constants
@@ -69,6 +70,9 @@ const (
 	SubscriptionStatusSuspended = "suspended"
 )
 
+// AntigravityGemini31ProAgentModel is the upstream route for Gemini 3.1 Pro High.
+const AntigravityGemini31ProAgentModel = "gemini-pro-agent"
+
 // DefaultAntigravityModelMapping 是 Antigravity 平台的默认模型映射
 // 当账号未配置 model_mapping 时使用此默认值
 // 与前端 useModelWhitelist.ts 中的 antigravityDefaultMappings 保持一致
@@ -104,10 +108,12 @@ var DefaultAntigravityModelMapping = map[string]string{
 	"gemini-3-flash-preview": "gemini-3-flash",
 	"gemini-3-pro-preview":   "gemini-3-pro-high",
 	// Gemini 3.1 白名单
-	"gemini-3.1-pro-high": "gemini-3.1-pro-high",
-	"gemini-3.1-pro-low":  "gemini-3.1-pro-low",
+	AntigravityGemini31ProAgentModel: AntigravityGemini31ProAgentModel,
+	"gemini-3.1-pro":                 AntigravityGemini31ProAgentModel,
+	"gemini-3.1-pro-high":            AntigravityGemini31ProAgentModel,
+	"gemini-3.1-pro-low":             "gemini-3.1-pro-low",
 	// Gemini 3.1 preview 映射
-	"gemini-3.1-pro-preview": "gemini-3.1-pro-high",
+	"gemini-3.1-pro-preview": AntigravityGemini31ProAgentModel,
 	// Gemini 3.1 image 白名单
 	"gemini-3.1-flash-image": "gemini-3.1-flash-image",
 	// Gemini 3.1 image preview 映射
@@ -123,12 +129,19 @@ var DefaultAntigravityModelMapping = map[string]string{
 // DefaultKiroModelMapping 是 Kiro 平台的默认模型映射。
 // 键为对外暴露/允许请求的模型名，值为实际发送到 Kiro 上游的模型名。
 var DefaultKiroModelMapping = map[string]string{
+	"gpt-5.6-sol":                         "gpt-5.6-sol",
+	"gpt-5.6-terra":                       "gpt-5.6-terra",
+	"gpt-5.6-luna":                        "gpt-5.6-luna",
 	"claude-opus-4-8":                     "claude-opus-4.8",
 	"claude-opus-4-8-thinking":            "claude-opus-4.8",
 	"claude-opus-4-7":                     "claude-opus-4.7",
 	"claude-opus-4-7-thinking":            "claude-opus-4.7",
 	"claude-opus-4-6":                     "claude-opus-4.6",
 	"claude-opus-4-6-thinking":            "claude-opus-4.6",
+	"claude-opus-5":                       "claude-opus-5",
+	"claude-opus-5-thinking":              "claude-opus-5",
+	"claude-sonnet-5":                     "claude-sonnet-5",
+	"claude-sonnet-5-thinking":            "claude-sonnet-5",
 	"claude-sonnet-4-6":                   "claude-sonnet-4.6",
 	"claude-sonnet-4-6-thinking":          "claude-sonnet-4.6",
 	"claude-opus-4-5-20251101":            "claude-opus-4.5",
@@ -147,6 +160,7 @@ var DefaultBedrockModelMapping = map[string]string{
 	// Claude Fable
 	"claude-fable-5": "anthropic.claude-fable-5",
 	// Claude Opus
+	"claude-opus-5":            "us.anthropic.claude-opus-5-v1",
 	"claude-opus-4-8":          "us.anthropic.claude-opus-4-8-v1",
 	"claude-opus-4-7":          "us.anthropic.claude-opus-4-7-v1",
 	"claude-opus-4-6-thinking": "us.anthropic.claude-opus-4-6-v1",

@@ -79,7 +79,7 @@ func (s *GatewayService) shouldEmulateWebSearch(ctx context.Context, account *Ac
 		default:
 			return s.isChannelWebSearchEmulationEnabled(ctx, groupID, account.Platform)
 		}
-	case account.Platform == PlatformKiro && account.Type == AccountTypeOAuth:
+	case isKiroDirectModeAccount(account):
 		return s.isChannelWebSearchEmulationEnabled(ctx, groupID, account.Platform)
 	default:
 		return false
@@ -139,6 +139,25 @@ func extractSearchQueryFromBody(body []byte) string {
 	return extractWebSearchTextFromContent(lastMsg.Get("content"))
 }
 
+// ExtractWebSearchQueryFromBody returns the client-authored search query before
+// gateway-side prompt rules modify the forwarded request.
+func ExtractWebSearchQueryFromBody(body []byte) string {
+	return extractSearchQueryFromBody(body)
+}
+
+func webSearchQueryForParsedRequest(parsed *ParsedRequest) string {
+	if parsed == nil {
+		return ""
+	}
+	if parsed.OriginalUserQuery != nil {
+		return *parsed.OriginalUserQuery
+	}
+	if parsed.Body == nil {
+		return ""
+	}
+	return extractSearchQueryFromBody(parsed.Body.Bytes())
+}
+
 func extractWebSearchTextFromContent(content gjson.Result) string {
 	if content.Type == gjson.String {
 		return content.String()
@@ -167,7 +186,7 @@ func (s *GatewayService) handleWebSearchEmulation(
 		parsed.OnUpstreamAccepted()
 	}
 
-	query := extractSearchQueryFromBody(parsed.Body.Bytes())
+	query := webSearchQueryForParsedRequest(parsed)
 	if query == "" {
 		return nil, fmt.Errorf("web search emulation: no query found in messages")
 	}
@@ -195,8 +214,8 @@ func (s *GatewayService) handleWebSearchEmulation(
 		model = defaultWebSearchModel
 	}
 	body := parsed.Body.Bytes()
-	inputTokens := estimateKiroInputTokens(body)
-	cacheUsage := s.buildKiroCacheEmulationUsage(account, parsed.Group, body, model, inputTokens)
+	inputTokens := estimateKiroInputTokens(ctx, body)
+	cacheUsage := s.buildKiroCacheEmulationUsage(ctx, account, parsed.Group, body, model, inputTokens)
 
 	if parsed.Stream {
 		return writeWebSearchStreamResponse(c, query, resp, model, startTime, inputTokens, cacheUsage)

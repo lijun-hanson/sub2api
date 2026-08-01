@@ -195,6 +195,12 @@ func TestClaudeTokenRefresher_CanRefresh(t *testing.T) {
 			want:     true,
 		},
 		{
+			name:     "anthropic setup-token - can refresh",
+			platform: PlatformAnthropic,
+			accType:  AccountTypeSetupToken,
+			want:     true,
+		},
+		{
 			name:     "anthropic api-key - cannot refresh",
 			platform: PlatformAnthropic,
 			accType:  AccountTypeAPIKey,
@@ -259,4 +265,31 @@ func TestOpenAITokenRefresher_CanRefresh(t *testing.T) {
 			require.Equal(t, tt.want, refresher.CanRefresh(account))
 		})
 	}
+}
+
+func TestKiroTokenRefresher_NeedsRefreshMissingExpiresAtWithRefreshToken(t *testing.T) {
+	refresher := NewKiroTokenRefresher(nil)
+	account := &Account{
+		Platform: PlatformKiro,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token":  "access-token",
+			"refresh_token": "refresh-token",
+		},
+	}
+
+	require.True(t, refresher.NeedsRefresh(account, 30*time.Minute))
+}
+
+func TestKiroTokenRefresher_NeedsRefreshMissingExpiresAtWithoutRefreshToken(t *testing.T) {
+	refresher := NewKiroTokenRefresher(nil)
+	account := &Account{
+		Platform: PlatformKiro,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "access-token",
+		},
+	}
+
+	require.False(t, refresher.NeedsRefresh(account, 30*time.Minute))
 }

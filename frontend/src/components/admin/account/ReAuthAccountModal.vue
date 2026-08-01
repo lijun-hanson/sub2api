@@ -19,8 +19,10 @@
                     ? 'from-amber-500 to-amber-600'
                     : isAntigravity
                       ? 'from-purple-500 to-purple-600'
-                      : isGrok
-                        ? 'from-zinc-700 to-zinc-900'
+                  : isAntigravity
+                    ? 'from-purple-500 to-purple-600'
+                    : isGrok
+                      ? 'from-zinc-700 to-zinc-900'
                       : 'from-orange-500 to-orange-600'
             ]"
           >
@@ -38,8 +40,10 @@
                       ? t('admin.accounts.kiroAccount')
                       : isAntigravity
                         ? t('admin.accounts.antigravityAccount')
-                        : isGrok
-                          ? t('admin.accounts.grokAccount')
+                    : isAntigravity
+                      ? t('admin.accounts.antigravityAccount')
+                      : isGrok
+                        ? t('admin.accounts.grokAccount')
                         : t('admin.accounts.claudeCodeAccount')
               }}
             </span>
@@ -117,7 +121,7 @@
         <div class="mb-3 text-sm font-medium text-amber-900 dark:text-amber-100">
           {{ t('admin.accounts.oauth.kiro.authModeTitle') }}
         </div>
-        <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-4">
           <button
             type="button"
             @click="kiroAccountType = 'oauth'"
@@ -163,6 +167,30 @@
               </span>
               <span class="text-xs text-gray-500 dark:text-gray-400">
                 {{ t('admin.accounts.oauth.kiro.idcSubtitle') }}
+              </span>
+            </div>
+          </button>
+          <button
+            type="button"
+            @click="kiroAccountType = 'external_idp'"
+            :class="kiroModeClass('external_idp')"
+          >
+            <div
+              :class="[
+                'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg',
+                kiroAccountType === 'external_idp'
+                  ? 'bg-emerald-500 text-white'
+                  : 'bg-gray-100 text-gray-500 dark:bg-dark-600 dark:text-gray-400'
+              ]"
+            >
+              <Icon name="shield" size="sm" />
+            </div>
+            <div class="min-w-0">
+              <span class="block text-sm font-medium text-gray-900 dark:text-white">
+                {{ t('admin.accounts.oauth.kiro.externalIdpTitle') }}
+              </span>
+              <span class="text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.oauth.kiro.externalIdpSubtitle') }}
               </span>
             </div>
           </button>
@@ -271,23 +299,45 @@
 
         <div v-if="isKiroImportMode" class="mt-3 space-y-3">
           <div>
-            <label class="input-label">{{ t('admin.accounts.oauth.kiro.tokenJsonLabel') }}</label>
+            <label class="input-label">{{ t('admin.accounts.oauth.kiro.importProviderLabel') }}</label>
+            <div class="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              <label
+                v-for="opt in kiroImportProviderOptions"
+                :key="opt"
+                class="flex cursor-pointer items-center rounded-lg border px-3 py-2"
+                :class="kiroImportProvider === opt
+                  ? 'border-primary-500 bg-primary-50 dark:border-primary-400 dark:bg-primary-900/20'
+                  : 'border-gray-200 dark:border-dark-600'"
+              >
+                <input
+                  v-model="kiroImportProvider"
+                  type="radio"
+                  :value="opt"
+                  class="mr-2 text-primary-600 focus:ring-primary-500"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-300">{{ opt }}</span>
+              </label>
+            </div>
+          </div>
+          <div>
+            <label class="input-label">{{ t('admin.accounts.oauth.kiro.tokenJsonLabel') }} <span class="text-red-500">*</span></label>
             <textarea
               v-model="kiroTokenJson"
               rows="7"
               class="input font-mono text-xs"
-              placeholder='{"accessToken":"...","refreshToken":"..."}'
+              :placeholder="kiroImportTokenPlaceholder"
             />
             <p class="input-hint">{{ t('admin.accounts.oauth.kiro.tokenJsonHint') }}</p>
           </div>
-          <div>
-            <label class="input-label">{{ t('admin.accounts.oauth.kiro.deviceRegistrationLabel') }}</label>
+          <div v-if="kiroImportNeedsDeviceRegistration">
+            <label class="input-label">{{ t('admin.accounts.oauth.kiro.deviceRegistrationLabel') }} <span class="text-red-500">*</span></label>
             <textarea
               v-model="kiroDeviceRegistrationJson"
               rows="4"
               class="input font-mono text-xs"
               placeholder='{"clientId":"...","clientSecret":"..."}'
             />
+            <p class="input-hint">{{ t('admin.accounts.oauth.kiro.deviceRegistrationHint') }}</p>
           </div>
         </div>
       </div>
@@ -307,6 +357,8 @@
         :method-label="t('admin.accounts.inputMethod')"
         :platform="oauthPlatform"
         :show-project-id="isGemini && geminiOAuthType === 'code_assist'"
+        :is-kiro-external-idp="isKiro && kiroAccountType === 'external_idp'"
+        :external-idp-stage="kiroOAuth.externalIdpStage.value"
         @generate-url="handleGenerateUrl"
         @cookie-auth="handleCookieAuth"
       />
@@ -320,7 +372,7 @@
         <button
           v-if="isKiroImportMode"
           type="button"
-          :disabled="currentLoading || !kiroTokenJson.trim()"
+          :disabled="currentLoading || !kiroTokenJson.trim() || (kiroImportNeedsDeviceRegistration && !kiroDeviceRegistrationJson.trim())"
           class="btn btn-primary"
           @click="handleKiroImport"
         >
@@ -353,7 +405,13 @@
               d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
             />
           </svg>
-          {{ currentLoading ? t('admin.accounts.oauth.verifying') : t('admin.accounts.oauth.completeAuth') }}
+          {{
+            currentLoading
+              ? t('admin.accounts.oauth.verifying')
+              : (isKiro && kiroAccountType === 'external_idp' && kiroOAuth.externalIdpStage.value === 'portal')
+                ? t('admin.accounts.oauth.kiro.extIdpNextStep')
+                : t('admin.accounts.oauth.completeAuth')
+          }}
         </button>
       </div>
     </template>
@@ -364,7 +422,6 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import { useGrokOAuth } from '@/composables/useGrokOAuth'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Icon from '@/components/icons/Icon.vue'
 import OAuthAuthorizationFlow from '@/components/account/OAuthAuthorizationFlow.vue'
@@ -379,6 +436,7 @@ import { useKiroOAuth } from '@/composables/useKiroOAuth'
 import { useOpenAIOAuth } from '@/composables/useOpenAIOAuth'
 import { useAppStore } from '@/stores/app'
 import type { Account, AccountPlatform } from '@/types'
+import { useGrokOAuth } from '@/composables/useGrokOAuth'
 
 interface OAuthFlowExposed {
   authCode: string
@@ -416,12 +474,27 @@ const oauthFlowRef = ref<OAuthFlowExposed | null>(null)
 
 const addMethod = ref<AddMethod>('oauth')
 const geminiOAuthType = ref<'code_assist' | 'google_one' | 'ai_studio'>('code_assist')
-const kiroAccountType = ref<'oauth' | 'idc' | 'import'>('oauth')
+const kiroAccountType = ref<'oauth' | 'idc' | 'external_idp' | 'import'>('oauth')
 const kiroOAuthProvider = ref<'google' | 'github'>('google')
 const kiroIDCStartUrl = ref('https://view.awsapps.com/start')
 const kiroIDCRegion = ref('us-east-1')
 const kiroTokenJson = ref('')
 const kiroDeviceRegistrationJson = ref('')
+// 「从 Kiro IDE 导入」账号来源:决定字段显隐/必填/示例,并与 token JSON 内 provider 做一致性校验。
+const kiroImportProvider = ref<'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'ExternalIdp'>('Google')
+const kiroImportProviderOptions = ['Google', 'Github', 'BuilderId', 'Enterprise', 'ExternalIdp'] as const
+// BuilderId/Enterprise(IDC)需 Device Registration JSON;Google/Github(社交)不需要。
+const kiroImportNeedsDeviceRegistration = computed(
+  () => kiroImportProvider.value === 'BuilderId' || kiroImportProvider.value === 'Enterprise'
+)
+const kiroImportTokenPlaceholder = computed(() => {
+  if (kiroImportProvider.value === 'ExternalIdp') {
+    return '{"accessToken":"...","refreshToken":"...","authMethod":"external_idp","provider":"ExternalIdp","clientId":"...","tokenEndpoint":"https://idp.example.com/token","issuerUrl":"https://idp.example.com","scopes":"openid profile email"}'
+  }
+  return kiroImportNeedsDeviceRegistration.value
+    ? '{"accessToken":"...","refreshToken":"...","clientIdHash":"...","authMethod":"IdC","provider":"' + kiroImportProvider.value + '"}'
+    : '{"accessToken":"...","refreshToken":"...","authMethod":"social","provider":"' + kiroImportProvider.value + '"}'
+})
 
 const isOpenAI = computed(() => props.account?.platform === 'openai')
 const isOpenAILike = computed(() => isOpenAI.value)
@@ -429,16 +502,15 @@ const isGemini = computed(() => props.account?.platform === 'gemini')
 const isAnthropic = computed(() => props.account?.platform === 'anthropic')
 const isAntigravity = computed(() => props.account?.platform === 'antigravity')
 const isKiro = computed(() => props.account?.platform === 'kiro')
-const isGrok = computed(() => props.account?.platform === 'grok')
 
 const oauthPlatform = computed<AccountPlatform>(() => {
   if (isOpenAI.value) return 'openai'
   if (isGemini.value) return 'gemini'
   if (isKiro.value) return 'kiro'
-  if (isGrok.value) return 'grok'
   if (isAntigravity.value) return 'antigravity'
   return 'anthropic'
 })
+const isGrok = computed(() => props.account?.platform === 'grok')
 
 const currentAuthUrl = computed(() => {
   if (isOpenAILike.value) return openaiOAuth.authUrl.value
@@ -479,7 +551,7 @@ const currentError = computed(() => {
 const isKiroImportMode = computed(() => isKiro.value && kiroAccountType.value === 'import')
 
 const isManualInputMethod = computed(() => {
-  // OpenAI/Gemini/Kiro/Antigravity/Grok always use manual input (no cookie auth option)
+  // These providers always use manual input (no cookie auth option).
   return isOpenAILike.value || isGemini.value || isKiro.value || isAntigravity.value || isGrok.value || oauthFlowRef.value?.inputMethod === 'manual'
 })
 
@@ -517,13 +589,39 @@ watch(
       const creds = (props.account.credentials || {}) as Record<string, unknown>
       const authMethod = typeof creds.auth_method === 'string' ? creds.auth_method : ''
       const provider = String(creds.provider || '').toLowerCase()
-      kiroIDCStartUrl.value = typeof creds.start_url === 'string' && creds.start_url ? creds.start_url : 'https://view.awsapps.com/start'
+      const startUrl = typeof creds.start_url === 'string' && creds.start_url ? creds.start_url : 'https://view.awsapps.com/start'
+      kiroIDCStartUrl.value = startUrl
       kiroIDCRegion.value = typeof creds.region === 'string' && creds.region ? creds.region : 'us-east-1'
-      kiroAccountType.value = authMethod === 'idc' ? 'idc' : 'oauth'
+      kiroAccountType.value = authMethod === 'idc'
+        ? 'idc'
+        : authMethod === 'external_idp'
+          ? 'external_idp'
+          : 'oauth'
       kiroOAuthProvider.value = provider === 'github' ? 'github' : 'google'
+      // 「从 Kiro IDE 导入」账号来源:按现有凭证的 provider 自动定位到五值之一。
+      kiroImportProvider.value = resolveKiroImportProvider(provider)
     }
   }
 )
+
+// resolveKiroImportProvider 按现有账号凭证的 provider 归一化到五值之一(不分大小写)。
+// provider 恒为 Google/Github/BuilderId/Enterprise/ExternalIdp 之一;异常兜底为 Google。
+const resolveKiroImportProvider = (
+  provider: string
+): 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'ExternalIdp' => {
+  switch (provider.toLowerCase()) {
+    case 'github':
+      return 'Github'
+    case 'builderid':
+      return 'BuilderId'
+    case 'enterprise':
+      return 'Enterprise'
+    case 'externalidp':
+      return 'ExternalIdp'
+    default:
+      return 'Google'
+  }
+}
 
 const resetState = () => {
   addMethod.value = 'oauth'
@@ -534,6 +632,7 @@ const resetState = () => {
   kiroIDCRegion.value = 'us-east-1'
   kiroTokenJson.value = ''
   kiroDeviceRegistrationJson.value = ''
+  kiroImportProvider.value = 'Google'
   claudeOAuth.resetState()
   openaiOAuth.resetState()
   geminiOAuth.resetState()
@@ -548,12 +647,16 @@ const kiroModeClass = (mode: typeof kiroAccountType.value) => [
   kiroAccountType.value === mode
     ? mode === 'idc'
       ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
-      : mode === 'import'
+      : mode === 'external_idp'
+        ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20'
+        : mode === 'import'
         ? 'border-slate-500 bg-slate-50 dark:bg-slate-900/20'
         : 'border-amber-500 bg-amber-50 dark:bg-amber-900/20'
     : mode === 'idc'
       ? 'border-gray-200 hover:border-blue-300 dark:border-dark-600 dark:hover:border-blue-700'
-      : mode === 'import'
+      : mode === 'external_idp'
+        ? 'border-gray-200 hover:border-emerald-300 dark:border-dark-600 dark:hover:border-emerald-700'
+        : mode === 'import'
         ? 'border-gray-200 hover:border-slate-300 dark:border-dark-600 dark:hover:border-slate-700'
         : 'border-gray-200 hover:border-amber-300 dark:border-dark-600 dark:hover:border-amber-700'
 ]
@@ -616,10 +719,12 @@ const handleGenerateUrl = async () => {
       })
       return
     }
-    await kiroOAuth.generateAuthUrl(
-      props.account.proxy_id,
-      kiroOAuthProvider.value === 'github' ? 'Github' : 'Google'
-    )
+    const provider = kiroAccountType.value === 'external_idp'
+      ? 'ExternalIdp'
+      : kiroOAuthProvider.value === 'github'
+        ? 'Github'
+        : 'Google'
+    await kiroOAuth.generateAuthUrl(props.account.proxy_id, provider)
     return
   }
 
@@ -755,7 +860,6 @@ const handleExchangeCode = async () => {
     }
     return
   }
-
   if (isGrok.value) {
     const sessionId = grokOAuth.sessionId.value
     if (!sessionId) return
@@ -792,6 +896,7 @@ const handleExchangeCode = async () => {
     return
   }
 
+  // Claude OAuth flow
   const sessionId = claudeOAuth.sessionId.value
   if (!sessionId) return
 
@@ -825,7 +930,37 @@ const handleExchangeCode = async () => {
 }
 
 const handleKiroImport = async () => {
-  if (!props.account || !isKiroImportMode.value || !kiroTokenJson.value.trim()) return
+  if (!props.account || !isKiroImportMode.value) return
+
+  // 必填校验:token JSON 必填;BuilderId/Enterprise 还需 Device Registration JSON。
+  if (!kiroTokenJson.value.trim()) {
+    kiroOAuth.error.value = t('admin.accounts.oauth.kiro.tokenJsonRequired')
+    appStore.showError(kiroOAuth.error.value)
+    return
+  }
+  if (kiroImportNeedsDeviceRegistration.value && !kiroDeviceRegistrationJson.value.trim()) {
+    kiroOAuth.error.value = t('admin.accounts.oauth.kiro.deviceRegistrationRequired')
+    appStore.showError(kiroOAuth.error.value)
+    return
+  }
+
+  // 一致性校验:token JSON 内 provider 必须与所选账号来源一致(后端白名单兜底)。
+  let parsedProvider = ''
+  try {
+    parsedProvider = String(JSON.parse(kiroTokenJson.value)?.provider ?? '').trim()
+  } catch {
+    kiroOAuth.error.value = t('admin.accounts.oauth.kiro.tokenJsonInvalid')
+    appStore.showError(kiroOAuth.error.value)
+    return
+  }
+  if (parsedProvider !== kiroImportProvider.value) {
+    kiroOAuth.error.value = t('admin.accounts.oauth.kiro.providerMismatch', {
+      selected: kiroImportProvider.value,
+      actual: parsedProvider || '-'
+    })
+    appStore.showError(kiroOAuth.error.value)
+    return
+  }
 
   const tokenInfo = await kiroOAuth.importToken(
     kiroTokenJson.value,

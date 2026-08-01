@@ -32,9 +32,11 @@ func thinkingSignature(content, model, messageID string) string {
 	signatureCacheMu.Lock()
 	if elem, ok := signatureCacheMap[cacheKey]; ok {
 		signatureLRU.MoveToFront(elem)
-		cached, _ := elem.Value.(*sigCacheEntry)
 		signatureCacheMu.Unlock()
-		return cached.value
+		if entry, ok := elem.Value.(*sigCacheEntry); ok && entry != nil {
+			return entry.value
+		}
+		return ""
 	}
 	signatureCacheMu.Unlock()
 
@@ -43,8 +45,9 @@ func thinkingSignature(content, model, messageID string) string {
 	signatureCacheMu.Lock()
 	for signatureLRU.Len() >= signatureCacheMaxSize {
 		if oldest := signatureLRU.Back(); oldest != nil {
-			entry, _ := oldest.Value.(*sigCacheEntry)
-			delete(signatureCacheMap, entry.key)
+			if entry, ok := oldest.Value.(*sigCacheEntry); ok && entry != nil {
+				delete(signatureCacheMap, entry.key)
+			}
 			signatureLRU.Remove(oldest)
 		}
 	}
