@@ -114,6 +114,52 @@ func TestGetIntervalPricing_NoMatch_FallsBackToBase(t *testing.T) {
 	require.Equal(t, basePricing, result)
 }
 
+func TestGPT56ExplicitZeroCacheWritePriceIsPreserved(t *testing.T) {
+	bs := &BillingService{}
+	resolver := NewModelPricingResolver(nil, bs)
+	zero := 0.0
+
+	t.Run("flat channel price", func(t *testing.T) {
+		resolved := &ResolvedPricing{
+			Mode: BillingModeToken,
+			BasePricing: &ModelPricing{
+				InputPricePerToken:  5e-6,
+				OutputPricePerToken: 30e-6,
+			},
+		}
+		resolver.applyTokenOverrides(&ChannelModelPricing{CacheWritePrice: &zero}, resolved)
+
+		require.True(t, resolved.BasePricing.CacheCreationPriceExplicit)
+		cost, err := bs.CalculateCostUnified(CostInput{
+			Model:          "gpt-5.6-sol",
+			Tokens:         UsageTokens{CacheCreationTokens: 100},
+			RateMultiplier: 1,
+			Resolver:       resolver,
+			Resolved:       resolved,
+		})
+		require.NoError(t, err)
+		require.Zero(t, cost.CacheCreationCost)
+	})
+
+	t.Run("interval price", func(t *testing.T) {
+		pricing := intervalToModelPricing(&PricingInterval{CacheWritePrice: &zero}, false, nil)
+		require.True(t, pricing.CacheCreationPriceExplicit)
+
+		cost, err := bs.CalculateCostUnified(CostInput{
+			Model:          "gpt-5.6-sol",
+			Tokens:         UsageTokens{CacheCreationTokens: 100},
+			RateMultiplier: 1,
+			Resolver:       resolver,
+			Resolved: &ResolvedPricing{
+				Mode:        BillingModeToken,
+				BasePricing: pricing,
+			},
+		})
+		require.NoError(t, err)
+		require.Zero(t, cost.CacheCreationCost)
+	})
+}
+
 func TestGetRequestTierPrice(t *testing.T) {
 	bs := newTestBillingServiceForResolver()
 	r := NewModelPricingResolver(&ChannelService{}, bs)
@@ -166,8 +212,8 @@ func TestGetRequestTierPrice_NilPerRequestPrice(t *testing.T) {
 // ===========================================================================
 
 // helper: creates a resolver wired to a ChannelService that returns the given
-// channel (active, groupID=100, platform=anthropic) with the specified pricing.
-func newResolverWithChannel(t *testing.T, pricing []ChannelModelPricing) *ModelPricingResolver {
+// channel (active, groupID=100) with the specified platform and pricing.
+func newResolverWithPlatformChannel(t *testing.T, platform string, pricing []ChannelModelPricing) *ModelPricingResolver {
 	t.Helper()
 	const groupID = 100
 	repo := &mockChannelRepository{
@@ -181,12 +227,18 @@ func newResolverWithChannel(t *testing.T, pricing []ChannelModelPricing) *ModelP
 			}}, nil
 		},
 		getGroupPlatformsFn: func(_ context.Context, _ []int64) (map[int64]string, error) {
-			return map[int64]string{groupID: "anthropic"}, nil
+			return map[int64]string{groupID: platform}, nil
 		},
 	}
 	cs := NewChannelService(repo, nil, nil, nil)
-	bs := newTestBillingServiceForResolver()
+	bs := NewBillingService(nil, nil)
 	return NewModelPricingResolver(cs, bs)
+}
+
+// helper: creates a resolver wired to a ChannelService that returns the given
+// channel (active, groupID=100, platform=anthropic) with the specified pricing.
+func newResolverWithChannel(t *testing.T, pricing []ChannelModelPricing) *ModelPricingResolver {
+	return newResolverWithPlatformChannel(t, "anthropic", pricing)
 }
 
 // groupIDPtr returns a pointer to groupID 100 (the test constant).
@@ -195,6 +247,50 @@ func groupIDPtr() *int64 { v := int64(100); return &v }
 // ---------------------------------------------------------------------------
 // 1. Token mode overrides
 // ---------------------------------------------------------------------------
+
+func TestResolve_KiroGPT56UsesChannelPricingBeforeDefaultOpenAIPricing(t *testing.T) {
+	r := newResolverWithPlatformChannel(t, PlatformKiro, []ChannelModelPricing{{
+		Platform:        PlatformKiro,
+		Models:          []string{"gpt-5.6-sol"},
+		BillingMode:     BillingModeToken,
+		InputPrice:      testPtrFloat64(0.11),
+		OutputPrice:     testPtrFloat64(0.22),
+		CacheWritePrice: testPtrFloat64(0.33),
+		CacheReadPrice:  testPtrFloat64(0.044),
+	}})
+
+	resolved := r.Resolve(context.Background(), PricingInput{
+		Model:   "gpt-5.6-sol",
+		GroupID: groupIDPtr(),
+	})
+
+	require.NotNil(t, resolved)
+	require.Equal(t, BillingModeToken, resolved.Mode)
+	require.Equal(t, PricingSourceChannel, resolved.Source)
+	require.NotNil(t, resolved.BasePricing)
+	require.InDelta(t, 0.11, resolved.BasePricing.InputPricePerToken, 1e-12)
+	require.InDelta(t, 0.22, resolved.BasePricing.OutputPricePerToken, 1e-12)
+	require.InDelta(t, 0.33, resolved.BasePricing.CacheCreationPricePerToken, 1e-12)
+	require.InDelta(t, 0.044, resolved.BasePricing.CacheReadPricePerToken, 1e-12)
+}
+
+func TestResolve_KiroGPT56FallsBackToDefaultOpenAIPricingWhenNoChannelPrice(t *testing.T) {
+	r := newResolverWithPlatformChannel(t, PlatformKiro, nil)
+
+	resolved := r.Resolve(context.Background(), PricingInput{
+		Model:   "gpt-5.6-luna",
+		GroupID: groupIDPtr(),
+	})
+
+	require.NotNil(t, resolved)
+	require.Equal(t, BillingModeToken, resolved.Mode)
+	require.Equal(t, PricingSourceLiteLLM, resolved.Source)
+	require.NotNil(t, resolved.BasePricing)
+	require.InDelta(t, 0.2e-6, resolved.BasePricing.InputPricePerToken, 1e-12)
+	require.InDelta(t, 1.2e-6, resolved.BasePricing.OutputPricePerToken, 1e-12)
+	require.InDelta(t, 0.25e-6, resolved.BasePricing.CacheCreationPricePerToken, 1e-12)
+	require.InDelta(t, 0.02e-6, resolved.BasePricing.CacheReadPricePerToken, 1e-12)
+}
 
 func TestResolve_WithChannelOverride_TokenFlat(t *testing.T) {
 	r := newResolverWithChannel(t, []ChannelModelPricing{{
@@ -726,4 +822,64 @@ func TestApplyTokenOverrides_IntervalSetsImageOutputPriceExplicit(t *testing.T) 
 	pricing := r.GetIntervalPricing(resolved, 50000)
 	require.True(t, pricing.ImageOutputPriceExplicit)
 	require.Equal(t, 0.0, pricing.ImageOutputPricePerToken)
+}
+
+// ===========================================================================
+// 10. Regression: channel overrides must not pollute fallbackPrices
+// ===========================================================================
+
+// TestApplyTokenOverrides_FlatDoesNotPolluteFallbackPrices verifies that the
+// flat-override path in applyTokenOverrides clones the BasePricing struct
+// before mutation, so the shared fallbackPrices map entry is not written through.
+func TestApplyTokenOverrides_FlatDoesNotPolluteFallbackPrices(t *testing.T) {
+	r := newResolverWithChannel(t, []ChannelModelPricing{{
+		Platform:    "anthropic",
+		Models:      []string{"claude-sonnet-4"},
+		BillingMode: BillingModeToken,
+		InputPrice:  testPtrFloat64(10e-6), // base is 3e-6
+		OutputPrice: testPtrFloat64(50e-6), // base is 15e-6
+	}})
+
+	resolved := r.Resolve(context.Background(), PricingInput{
+		Model:   "claude-sonnet-4",
+		GroupID: groupIDPtr(),
+	})
+
+	// Resolved pricing should reflect the channel override
+	require.NotNil(t, resolved)
+	require.InDelta(t, 10e-6, resolved.BasePricing.InputPricePerToken, 1e-12)
+	require.InDelta(t, 50e-6, resolved.BasePricing.OutputPricePerToken, 1e-12)
+
+	// Global fallbackPrices must NOT be polluted
+	fp := r.billingService.fallbackPrices["claude-sonnet-4"]
+	require.InDelta(t, 3e-6, fp.InputPricePerToken, 1e-12, "fallback InputPricePerToken polluted")
+	require.InDelta(t, 15e-6, fp.OutputPricePerToken, 1e-12, "fallback OutputPricePerToken polluted")
+	require.False(t, fp.ImageOutputPriceExplicit, "fallback ImageOutputPriceExplicit polluted")
+}
+
+// TestApplyTokenOverrides_IntervalDoesNotPolluteFallbackPrices verifies that
+// the interval-override path also clones before mutation.
+func TestApplyTokenOverrides_IntervalDoesNotPolluteFallbackPrices(t *testing.T) {
+	r := newResolverWithChannel(t, []ChannelModelPricing{{
+		Platform:    "anthropic",
+		Models:      []string{"claude-sonnet-4"},
+		BillingMode: BillingModeToken,
+		Intervals: []PricingInterval{
+			{MinTokens: 0, MaxTokens: testPtrInt(100000), InputPrice: testPtrFloat64(2e-6), OutputPrice: testPtrFloat64(8e-6)},
+		},
+	}})
+
+	resolved := r.Resolve(context.Background(), PricingInput{
+		Model:   "claude-sonnet-4",
+		GroupID: groupIDPtr(),
+	})
+
+	require.NotNil(t, resolved)
+	require.True(t, resolved.BasePricing.ImageOutputPriceExplicit)
+
+	// Global fallbackPrices must NOT be polluted
+	fp := r.billingService.fallbackPrices["claude-sonnet-4"]
+	require.InDelta(t, 3e-6, fp.InputPricePerToken, 1e-12, "fallback InputPricePerToken polluted")
+	require.InDelta(t, 15e-6, fp.OutputPricePerToken, 1e-12, "fallback OutputPricePerToken polluted")
+	require.False(t, fp.ImageOutputPriceExplicit, "fallback ImageOutputPriceExplicit polluted")
 }

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
@@ -135,7 +136,190 @@ func TestClaudeCodeValidator_BillingBlockRecognizedWithoutIdentityPrompt(t *test
 	require.True(t, ok)
 }
 
-func TestClaudeCodeValidator_BillingBlockNonCLIEntrypointFallsThrough(t *testing.T) {
+func TestClaudeCodeValidator_SecurityMonitorWithoutBillingBlock(t *testing.T) {
+	monitorPrompt, err := os.ReadFile("testdata/security_monitor_system_prompt.txt")
+	require.NoError(t, err)
+
+	validHeaders := map[string]string{
+		"User-Agent":        "claude-cli/2.1.220 (external, cli)",
+		"X-App":             "cli",
+		"anthropic-beta":    "claude-code-20250219",
+		"anthropic-version": "2023-06-01",
+	}
+	validBody := func(prompt string) map[string]any {
+		return map[string]any{
+			"model": "claude-haiku-4-5-20251001",
+			"system": []any{
+				map[string]any{"type": "text", "text": prompt},
+			},
+			"metadata": map[string]any{"user_id": claudeCodeMetadataUserIDJSON},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		headers    map[string]string
+		body       map[string]any
+		wantAccept bool
+	}{
+		{
+			name:       "official classifier request",
+			headers:    validHeaders,
+			body:       validBody(string(monitorPrompt)),
+			wantAccept: true,
+		},
+		{
+			name:    "classifier output with category element",
+			headers: validHeaders,
+			body: validBody(strings.Replace(
+				string(monitorPrompt),
+				"<block>yes</block><reason>",
+				"<block>yes</block><category>Exact BLOCK Rule Name</category><reason>",
+				1,
+			)),
+			wantAccept: true,
+		},
+		{
+			name: "non-Claude user agent",
+			headers: map[string]string{
+				"User-Agent":        "curl/8.0.0",
+				"X-App":             "cli",
+				"anthropic-beta":    "claude-code-20250219",
+				"anthropic-version": "2023-06-01",
+			},
+			body: validBody(string(monitorPrompt)),
+		},
+		{
+			name: "missing X-App",
+			headers: map[string]string{
+				"User-Agent":        validHeaders["User-Agent"],
+				"anthropic-beta":    validHeaders["anthropic-beta"],
+				"anthropic-version": validHeaders["anthropic-version"],
+			},
+			body: validBody(string(monitorPrompt)),
+		},
+		{
+			name: "missing anthropic-beta",
+			headers: map[string]string{
+				"User-Agent":        validHeaders["User-Agent"],
+				"X-App":             validHeaders["X-App"],
+				"anthropic-version": validHeaders["anthropic-version"],
+			},
+			body: validBody(string(monitorPrompt)),
+		},
+		{
+			name: "missing anthropic-version",
+			headers: map[string]string{
+				"User-Agent":     validHeaders["User-Agent"],
+				"X-App":          validHeaders["X-App"],
+				"anthropic-beta": validHeaders["anthropic-beta"],
+			},
+			body: validBody(string(monitorPrompt)),
+		},
+		{
+			name:    "missing metadata",
+			headers: validHeaders,
+			body: map[string]any{
+				"model":  "claude-haiku-4-5-20251001",
+				"system": []any{map[string]any{"type": "text", "text": string(monitorPrompt)}},
+			},
+		},
+		{
+			name:    "invalid metadata user ID",
+			headers: validHeaders,
+			body: func() map[string]any {
+				body := validBody(string(monitorPrompt))
+				body["metadata"] = map[string]any{"user_id": "invalid"}
+				return body
+			}(),
+		},
+		{
+			name:       "unrelated prompt",
+			headers:    validHeaders,
+			body:       validBody("You are a different security classifier for coding agents."),
+			wantAccept: false,
+		},
+		{
+			name:       "opening sentence alone",
+			headers:    validHeaders,
+			body:       validBody(claudeCodeSecurityMonitorPromptPrefix),
+			wantAccept: false,
+		},
+		{
+			name:    "opening sentence plus arbitrary altered suffix",
+			headers: validHeaders,
+			body: validBody(claudeCodeSecurityMonitorPromptPrefix + "\n\n" +
+				strings.Repeat("This is arbitrary altered classifier content. ", 300)),
+			wantAccept: false,
+		},
+		{
+			name:    "multiple system entries without billing block",
+			headers: validHeaders,
+			body: func() map[string]any {
+				body := validBody(string(monitorPrompt))
+				system, ok := body["system"].([]any)
+				require.True(t, ok)
+				body["system"] = append(system, map[string]any{
+					"type": "text",
+					"text": "Additional unrelated system content.",
+				})
+				return body
+			}(),
+			wantAccept: false,
+		},
+	}
+
+	validator := NewClaudeCodeValidator()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
+			for name, value := range tt.headers {
+				req.Header.Set(name, value)
+			}
+
+			require.Equal(t, tt.wantAccept, validator.Validate(req, tt.body))
+		})
+	}
+}
+
+func TestClaudeCodeValidator_BillingBlockVSCodeEntrypointRecognized(t *testing.T) {
+	// 回归：Claude Code 在 VSCode 扩展内运行时，计费块入口为 cc_entrypoint=claude-vscode
+	// 而非 cli。其安全监视器子请求同样不携带身份 prose，此前写死 cc_entrypoint=cli 的
+	// 快速通道无法识别它，导致 claude_code_only 分组误拒。入口值不应作为识别条件。
+	monitorPrompt, err := os.ReadFile("testdata/security_monitor_system_prompt.txt")
+	require.NoError(t, err)
+
+	validator := NewClaudeCodeValidator()
+
+	// 前提：完整监视器正文经 Dice 相似度远低于阈值，放行只可能来自计费归因块识别。
+	require.Less(t, validator.bestSimilarityScore(string(monitorPrompt)), systemPromptThreshold)
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
+	req.Header.Set("User-Agent", "claude-cli/2.1.181 (external, claude-vscode, agent-sdk/0.3.181)")
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("anthropic-beta", "claude-code-20250219")
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	ok := validator.Validate(req, map[string]any{
+		"model": "claude-opus-4-8",
+		"system": []any{
+			map[string]any{
+				"type": "text",
+				"text": "x-anthropic-billing-header: cc_version=2.1.181.f17; cc_entrypoint=claude-vscode;",
+			},
+			map[string]any{
+				"type": "text",
+				"text": string(monitorPrompt),
+			},
+		},
+		"metadata": map[string]any{
+			"user_id": claudeCodeMetadataUserIDJSON,
+		},
+	})
+	require.True(t, ok)
+}
+
+func TestClaudeCodeValidator_BillingBlockWithoutEntrypointFallsThrough(t *testing.T) {
 	validator := NewClaudeCodeValidator()
 	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
 	req.Header.Set("User-Agent", "claude-cli/2.1.162 (external, cli)")
@@ -143,14 +327,14 @@ func TestClaudeCodeValidator_BillingBlockNonCLIEntrypointFallsThrough(t *testing
 	req.Header.Set("anthropic-beta", "claude-code-20250219")
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	// 计费块存在但 entrypoint 不是 cli（如 sdk），且无身份 prose：
-	// 不应凭前缀放行，应落回 Dice 检查并失败。验证 cc_entrypoint=cli 这一条件是必要的。
+	// 计费块前缀命中但完全没有 cc_entrypoint= 字段，且无身份 prose：
+	// 不应凭前缀放行，应落回 Dice 检查并失败。验证 cc_entrypoint= 字段的存在仍是必要条件。
 	ok := validator.Validate(req, map[string]any{
 		"model": "claude-3-5-haiku-20241022",
 		"system": []any{
 			map[string]any{
 				"type": "text",
-				"text": "x-anthropic-billing-header: cc_version=2.1.162.884; cc_entrypoint=sdk; cch=d8726;",
+				"text": "x-anthropic-billing-header: cc_version=2.1.162.884; cch=d8726;",
 			},
 			map[string]any{
 				"type": "text",
@@ -179,6 +363,65 @@ func TestClaudeCodeValidator_BillingBlockStillRequiresClaudeCodeUA(t *testing.T)
 			map[string]any{
 				"type": "text",
 				"text": "x-anthropic-billing-header: cc_version=2.1.162.884; cc_entrypoint=cli; cch=d8726;",
+			},
+		},
+	})
+	require.False(t, ok)
+}
+
+// 新版 Claude Code CLI 已取消 cch=... 签名字段，billing block 形如
+// `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;`（无 cch）。
+// 检测依赖前缀 + cc_entrypoint=cli，不依赖 cch，故无身份 prose 的子请求仍应被识别。
+// 这同时覆盖了本仓 mimicry 注入的新格式 block（见 buildBillingAttributionText）。
+func TestClaudeCodeValidator_BillingBlockRecognizedWithoutCCH(t *testing.T) {
+	monitorPrompt, err := os.ReadFile("testdata/security_monitor_system_prompt.txt")
+	require.NoError(t, err)
+
+	validator := NewClaudeCodeValidator()
+	require.Less(t, validator.bestSimilarityScore(string(monitorPrompt)), systemPromptThreshold)
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
+	req.Header.Set("User-Agent", "claude-cli/2.1.162 (external, cli)")
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("anthropic-beta", "claude-code-20250219")
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	ok := validator.Validate(req, map[string]any{
+		"model": "claude-3-5-haiku-20241022",
+		"system": []any{
+			map[string]any{
+				"type": "text",
+				// 注意：无 cch 段，对齐新版 CLI 与本仓新的注入格式。
+				"text": "x-anthropic-billing-header: cc_version=2.1.162.884; cc_entrypoint=cli;",
+			},
+			map[string]any{
+				"type": "text",
+				"text": string(monitorPrompt),
+			},
+		},
+		"metadata": map[string]any{
+			"user_id": claudeCodeMetadataUserIDJSON,
+		},
+	})
+	require.True(t, ok, "无 cch 的新版 billing block 仍应被识别为 Claude Code")
+}
+
+// 安全回归：去掉 cch 后检测并未放松——非 claude-cli UA 即便携带无 cch 的 billing block
+// 仍在 Step 1 被拒，ClaudeCodeOnly group 不会因此被仿冒绕过。
+func TestClaudeCodeValidator_NoCCHBlockStillRequiresClaudeCodeUA(t *testing.T) {
+	validator := NewClaudeCodeValidator()
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
+	req.Header.Set("User-Agent", "curl/8.0.0")
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("anthropic-beta", "claude-code-20250219")
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	ok := validator.Validate(req, map[string]any{
+		"model": "claude-3-5-haiku-20241022",
+		"system": []any{
+			map[string]any{
+				"type": "text",
+				"text": "x-anthropic-billing-header: cc_version=2.1.162.884; cc_entrypoint=cli;",
 			},
 		},
 	})

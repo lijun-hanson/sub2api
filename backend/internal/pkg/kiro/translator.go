@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,9 +35,16 @@ const (
 	kiroToolResultCompactLimit = 12000
 	kiroToolResultKeepHead     = 4000
 	kiroToolResultKeepTail     = 2000
-	kiroDefaultMaxOutputTokens = 32000
+	kiroDefaultMaxOutputTokens = 64000
 	kiroRemoteImageMaxBytes    = 10 << 20
 	kiroRemoteImageTimeout     = 8 * time.Second
+)
+
+// kiroUpstreamTraceEnabled 由环境变量 KIRO_UPSTREAM_TRACE=1 开启，仅用于诊断：
+// 打印 Kiro 上游原始事件类型与语义事件类型/内容前缀，定位 CoT 泄漏来自哪个通道。
+var kiroUpstreamTraceEnabled = os.Getenv("KIRO_UPSTREAM_TRACE") == "1"
+
+const (
 	thinkingStartTag           = "<thinking>"
 	thinkingEndTag             = "</thinking>"
 	embeddedToolCallPrefix     = "[Called "
@@ -57,10 +66,9 @@ const (
 )
 
 var (
-	trailingCommaPattern      = regexp.MustCompile(`,\s*([}\]])`)
 	kiroRemoteImageHTTPClient = &http.Client{Timeout: kiroRemoteImageTimeout}
 	requiredToolFields        = map[string][][]string{
-		"write":              {{"file_path", "path"}, {"content"}},
+		"write":              {{"filePath", "file_path", "path"}, {"content"}},
 		"write_to_file":      {{"path"}, {"content"}},
 		"fswrite":            {{"path"}, {"content"}},
 		"create_file":        {{"path"}, {"content"}},
@@ -81,6 +89,7 @@ type Usage struct {
 	CacheCreationInputTokens   int
 	CacheCreation5mInputTokens int
 	CacheCreation1hInputTokens int
+	KiroCredits                float64
 }
 
 type StreamResult struct {
@@ -103,6 +112,12 @@ type KiroRequestContext struct {
 	StructuredOutputUserHint string
 	StopSequences            []string
 	MaxOutputTokens          int
+	// EstimatedInputTokens 是调用方预估的输入 token 数，用于非流式路径兜底：
+	// Kiro 上游只上报 credits(meteringEvent),不发 tokenUsage,解析结果里的
+	// InputTokens 恒为 0。流式路径通过独立的 inputTokens 参数种入初值,非流式
+	// 没有对应入口,不兜底会让响应体 usage.input_tokens 输出 0。
+	// 为 0 时不生效（保持原行为）。
+	EstimatedInputTokens int
 }
 
 type KiroBuildResult struct {
@@ -248,12 +263,18 @@ type kiroSemanticEvent struct {
 
 func MapModel(model string) string {
 	switch strings.TrimSpace(strings.ToLower(model)) {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+		return strings.TrimSpace(strings.ToLower(model))
 	case "claude-opus-4-8", "claude-opus-4-8-thinking", "claude-opus-4.8":
 		return "claude-opus-4.8"
 	case "claude-opus-4-7", "claude-opus-4-7-thinking", "claude-opus-4.7":
 		return "claude-opus-4.7"
 	case "claude-opus-4-6", "claude-opus-4-6-thinking", "claude-opus-4.6":
 		return "claude-opus-4.6"
+	case "claude-opus-5", "claude-opus-5-thinking":
+		return "claude-opus-5"
+	case "claude-sonnet-5", "claude-sonnet-5-thinking":
+		return "claude-sonnet-5"
 	case "claude-sonnet-4-6", "claude-sonnet-4-6-thinking", "claude-sonnet-4.6":
 		return "claude-sonnet-4.6"
 	case "claude-opus-4-5-20251101", "claude-opus-4-5-20251101-thinking", "claude-opus-4.5":
@@ -305,7 +326,7 @@ func normalizeClaudeVersionNumber(model string) string {
 // requiresImplicitThinkingTagStripping 判断是否需要在客户端未显式请求 thinking 时
 // 仍开启流式/非流式解析器的 <thinking> tag 抽取。
 //
-// Opus 4.7/4.8 的内部 CoT 在 Kiro 上游以 <thinking>...</thinking> 文本形式流出,
+// Opus 4.7/4.8/5 的内部 CoT 在 Kiro 上游以 <thinking>...</thinking> 文本形式流出,
 // 不开启抽取会让标签和思考内容直接落到 assistant 正文,客户端看到形如
 // "<thinking>...</thinking>final" 的乱码。
 //
@@ -314,7 +335,8 @@ func normalizeClaudeVersionNumber(model string) string {
 func requiresImplicitThinkingTagStripping(modelID string) bool {
 	switch strings.TrimSpace(strings.ToLower(modelID)) {
 	case "claude-opus-4.7", "claude-opus-4-7", "claude-opus-4-7-thinking",
-		"claude-opus-4.8", "claude-opus-4-8", "claude-opus-4-8-thinking":
+		"claude-opus-4.8", "claude-opus-4-8", "claude-opus-4-8-thinking",
+		"claude-opus-5", "claude-opus-5-thinking":
 		return true
 	}
 	return false
@@ -331,14 +353,25 @@ func normalizeModelAlias(model string) string {
 	}
 }
 
+func isKiroGPTModel(modelID string) bool {
+	switch normalizeModelAlias(modelID) {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+		return true
+	default:
+		return false
+	}
+}
+
 func kiroMaxOutputTokensForModel(model string) int {
 	normalized := normalizeModelAlias(model)
 	switch normalized {
-	case "claude-opus-4-8", "claude-opus-4.8", "claude-opus-4-7", "claude-opus-4.7", "claude-opus-4-6", "claude-opus-4.6":
+	// Opus 4.7 / 4.8 / 5 与 Kiro GPT-5.6 精确模型上限 128000（对齐 Kiro 官方规格）。
+	case "claude-opus-4-8", "claude-opus-4.8", "claude-opus-4-7", "claude-opus-4.7",
+		"claude-opus-5",
+		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
 		return 128000
-	case "claude-sonnet-4-6", "claude-sonnet-4.6":
-		return 64000
 	default:
+		// 其余 Kiro 模型（opus-4.6 / sonnet-5 / sonnet-4.6 / 各 4.5 及未知兜底）统一 64000。
 		return kiroDefaultMaxOutputTokens
 	}
 }
@@ -412,6 +445,10 @@ func BuildKiroPayloadWithContext(claudeBody []byte, modelID, profileArn, origin 
 		} else {
 			baseSystem = inlineSystem
 		}
+	}
+	if isKiroGPTModel(modelID) {
+		thinking = nil
+		requestCtx.ThinkingEnabled = false
 	}
 	systemPrompt := buildInjectedSystemPrompt(baseSystem, thinking, toolChoiceHint)
 
@@ -500,6 +537,13 @@ func ParseNonStreamingEventStreamWithContext(body io.Reader, model string, reque
 	if requestCtx.CacheEmulationUsage != nil {
 		usage = mergeKiroCacheEmulationUsage(usage, requestCtx.CacheEmulationUsage)
 	}
+	// Kiro 不上报 tokenUsage,解析结果的 InputTokens 恒为 0；缓存模拟生效时会
+	// 顺带填上（inputTokens 减去缓存部分），未生效时用调用方预估值兜底,
+	// 避免响应体 usage.input_tokens 输出 0。放在 merge 之后,让缓存模拟的
+	// 更精确取值优先。
+	if usage.InputTokens == 0 && requestCtx.EstimatedInputTokens > 0 {
+		usage.InputTokens = requestCtx.EstimatedInputTokens
+	}
 	return &ParseResult{
 		ResponseBody: buildClaudeResponse(content, toolUses, model, usage, stopReason, requestCtx),
 		Usage:        usage,
@@ -519,10 +563,12 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 	thinkingBlockOpen := false
 	processedIDs := make(map[string]bool)
 	emittedToolContents := make(map[string]bool)
-	streamingToolBlockIndices := make(map[string]int)
-	streamingToolStarted := make(map[string]bool)
+	streamingToolNames := make(map[string]string)
 	streamingToolStopped := make(map[string]bool)
+	streamingToolInputBuf := make(map[string]*strings.Builder)
+	streamingToolInvalid := make(map[string]bool)
 	currentStreamingToolID := ""
+	toolBlockEmitted := false
 	pendingAssistantText := ""
 	lastContentFragment := ""
 	pendingLeadingWhitespace := ""
@@ -610,37 +656,45 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		thinkingBlockOpen = false
 		return writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": thinkingBlockIndex})
 	}
-	closeStreamingTool := func(toolUseID string) error {
-		if toolUseID == "" || !streamingToolStarted[toolUseID] || streamingToolStopped[toolUseID] {
-			return nil
+	discardStreamingTool := func(toolUseID string) {
+		if toolUseID == "" {
+			return
 		}
 		streamingToolStopped[toolUseID] = true
 		if currentStreamingToolID == toolUseID {
 			currentStreamingToolID = ""
 		}
-		return writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": streamingToolBlockIndices[toolUseID]})
+		delete(streamingToolNames, toolUseID)
+		delete(streamingToolInputBuf, toolUseID)
+		delete(streamingToolInvalid, toolUseID)
 	}
-	closeOpenStreamingTool := func() error {
-		return closeStreamingTool(currentStreamingToolID)
-	}
-	startStreamingToolUse := func(toolUseID, name string) error {
-		if toolUseID == "" || name == "" || streamingToolStopped[toolUseID] {
+	closeStreamingTool := func(toolUseID string) error {
+		if toolUseID == "" || streamingToolStopped[toolUseID] {
 			return nil
 		}
-		if currentStreamingToolID != "" && currentStreamingToolID != toolUseID {
-			if err := closeOpenStreamingTool(); err != nil {
-				return err
-			}
+		streamingToolStopped[toolUseID] = true
+
+		name := streamingToolNames[toolUseID]
+		buf := streamingToolInputBuf[toolUseID]
+		invalid := streamingToolInvalid[toolUseID]
+		discardStreamingTool(toolUseID)
+		if invalid || name == "" || buf == nil {
+			return nil
 		}
-		if stopReason == "" {
-			stopReason = "tool_use"
+
+		responseName := normalizeResponseToolName(restoreResponseToolName(name, requestCtx))
+		inputJSON, input, ok := normalizeStreamingToolInput(responseName, buf.String())
+		if !ok {
+			return nil
+		}
+		processedIDs[toolUseID] = true
+		tool := KiroToolUse{ToolUseID: toolUseID, Name: responseName, Input: input}
+		contentKey := toolUseContentKey(tool)
+		if contentKey == "" || emittedToolContents[contentKey] {
+			return nil
 		}
 		if err := ensureMessageStart(); err != nil {
 			return err
-		}
-		if firstDelta == nil {
-			delta := time.Since(start)
-			firstDelta = &delta
 		}
 		if err := closeThinking(); err != nil {
 			return err
@@ -648,92 +702,132 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		if err := closeText(); err != nil {
 			return err
 		}
-		blockIndex, ok := streamingToolBlockIndices[toolUseID]
-		if !ok {
-			contentBlockIndex++
-			blockIndex = contentBlockIndex
-			streamingToolBlockIndices[toolUseID] = blockIndex
+		if firstDelta == nil {
+			delta := time.Since(start)
+			firstDelta = &delta
 		}
-		currentStreamingToolID = toolUseID
-		if streamingToolStarted[toolUseID] {
-			return nil
-		}
-		streamingToolStarted[toolUseID] = true
-		return writeEvent("content_block_start", map[string]any{
+		contentBlockIndex++
+		blockIndex := contentBlockIndex
+		if err := writeEvent("content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": blockIndex,
 			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    toolUseID,
-				"name":  restoreResponseToolName(name, requestCtx),
+				"name":  responseName,
 				"input": map[string]any{},
 			},
-		})
-	}
-	emitStreamingToolInput := func(toolUseID, name, fragment string) error {
-		if fragment == "" {
-			return nil
-		}
-		if err := startStreamingToolUse(toolUseID, name); err != nil {
+		}); err != nil {
 			return err
 		}
-		if toolUseID == "" || !streamingToolStarted[toolUseID] || streamingToolStopped[toolUseID] {
-			return nil
-		}
-		_, _ = outputTextBuf.WriteString(fragment)
-		return writeEvent("content_block_delta", map[string]any{
+		if err := writeEvent("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
-			"index": streamingToolBlockIndices[toolUseID],
+			"index": blockIndex,
 			"delta": map[string]any{
 				"type":         "input_json_delta",
-				"partial_json": fragment,
+				"partial_json": inputJSON,
 			},
-		})
+		}); err != nil {
+			return err
+		}
+		if err := writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex}); err != nil {
+			return err
+		}
+		emittedToolContents[contentKey] = true
+		toolBlockEmitted = true
+		_, _ = outputTextBuf.WriteString(inputJSON)
+		if stopReason == "" {
+			stopReason = "tool_use"
+		}
+		return nil
+	}
+	closeOpenStreamingTool := func() error {
+		return closeStreamingTool(currentStreamingToolID)
+	}
+	bufferStreamingToolInput := func(toolUseID, name, fragment string, snapshot bool) error {
+		if toolUseID == "" || processedIDs[toolUseID] || streamingToolStopped[toolUseID] {
+			return nil
+		}
+		if currentStreamingToolID != "" && currentStreamingToolID != toolUseID {
+			if err := closeOpenStreamingTool(); err != nil {
+				return err
+			}
+		}
+		currentStreamingToolID = toolUseID
+		if name != "" {
+			streamingToolNames[toolUseID] = name
+		}
+		if snapshot {
+			delete(streamingToolInvalid, toolUseID)
+		} else if streamingToolInvalid[toolUseID] {
+			return nil
+		}
+		buf, ok := streamingToolInputBuf[toolUseID]
+		if !ok {
+			buf = &strings.Builder{}
+			streamingToolInputBuf[toolUseID] = buf
+		}
+		if snapshot {
+			buf.Reset()
+		}
+		if len(fragment) > maxEventMsgSize-buf.Len() {
+			streamingToolInvalid[toolUseID] = true
+			delete(streamingToolInputBuf, toolUseID)
+			return nil
+		}
+		_, _ = buf.WriteString(fragment)
+		return nil
 	}
 	processStreamingToolInput := func(toolUseID, name, fragment string, inputMap map[string]any) error {
 		if toolUseID == "" {
 			return nil
 		}
-		if err := startStreamingToolUse(toolUseID, name); err != nil {
-			return err
-		}
+		snapshot := false
 		if inputMap != nil {
 			encoded, err := json.Marshal(inputMap)
 			if err != nil {
 				return err
 			}
 			fragment = string(encoded)
+			snapshot = true
 		}
-		return emitStreamingToolInput(toolUseID, name, fragment)
+		return bufferStreamingToolInput(toolUseID, name, fragment, snapshot)
 	}
 	processStreamingToolStop := func(toolUseID string) error {
 		if toolUseID == "" {
 			toolUseID = currentStreamingToolID
 		}
-		if toolUseID == "" {
-			return nil
-		}
-		processedIDs[toolUseID] = true
-		if stopReason == "" {
-			stopReason = "tool_use"
-		}
 		return closeStreamingTool(toolUseID)
 	}
 	writeTextDelta := func(text string, allowWhitespace bool) error {
-		if text == "" || (!allowWhitespace && strings.TrimSpace(text) == "") {
+		if text == "" {
 			return nil
 		}
-		if err := closeOpenStreamingTool(); err != nil {
-			return err
-		}
-		if !textBlockOpen && !allowWhitespace {
-			if pendingLeadingWhitespace != "" {
-				text = strings.TrimLeftFunc(pendingLeadingWhitespace+text, unicode.IsSpace)
+		if !allowWhitespace {
+			if strings.TrimSpace(text) == "" {
+				// 纯空白片段: 文本块未开启时视为前导噪音直接丢弃;
+				// 已开启时先缓冲, 仅当后续出现真实文本才补回(中段空行);
+				// 若流结束时仍在缓冲则视为尾部空白, 自然不吐出。
+				if textBlockOpen {
+					pendingLeadingWhitespace += text
+				}
+				return nil
+			}
+			if !textBlockOpen {
+				// 首段真实文本: 裁掉其前导空白
+				text = strings.TrimLeftFunc(text, unicode.IsSpace)
 				pendingLeadingWhitespace = ""
 				if text == "" {
 					return nil
 				}
+			} else if pendingLeadingWhitespace != "" {
+				// 中段: 把缓冲的空行补回本段文本之前
+				text = pendingLeadingWhitespace + text
+				pendingLeadingWhitespace = ""
 			}
+		}
+		if err := closeOpenStreamingTool(); err != nil {
+			return err
 		}
 		if err := ensureMessageStart(); err != nil {
 			return err
@@ -773,7 +867,7 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		if stopSequenceMatched != "" {
 			return nil
 		}
-		if text == "" || (!allowWhitespace && strings.TrimSpace(text) == "") {
+		if text == "" {
 			return nil
 		}
 		if len(requestCtx.StopSequences) == 0 {
@@ -805,10 +899,15 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		return writeTextDelta(text, true)
 	}
 	emitToolUse := func(tool KiroToolUse) error {
+		structuredOutput := isStructuredOutputToolName(tool.Name, requestCtx)
+		tool.Name = normalizeResponseToolName(restoreResponseToolName(tool.Name, requestCtx))
+		if !structuredOutput && !isEmittableToolUse(tool) {
+			return nil
+		}
 		if !shouldEmitToolUse(tool, emittedToolContents) {
 			return nil
 		}
-		if isStructuredOutputToolName(tool.Name, requestCtx) {
+		if structuredOutput {
 			inputJSON, err := json.Marshal(tool.Input)
 			if err != nil {
 				inputJSON = []byte("{}")
@@ -837,7 +936,7 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    tool.ToolUseID,
-				"name":  restoreResponseToolName(tool.Name, requestCtx),
+				"name":  tool.Name,
 				"input": map[string]any{},
 			},
 		}); err != nil {
@@ -855,7 +954,11 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		}); err != nil {
 			return err
 		}
-		return writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": contentBlockIndex})
+		if err := writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": contentBlockIndex}); err != nil {
+			return err
+		}
+		toolBlockEmitted = true
+		return nil
 	}
 	flushPendingAssistantText := func() error {
 		text, embeddedTools, pending := drainEmbeddedToolText(pendingAssistantText)
@@ -1043,9 +1146,16 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		// 上游中间帧若透传 pause_turn/refusal/stop_sequence 等新值会让客户端误判为终态
 		// 其余值忽略,等流真正 EOF 时由后续兜底分支按 tool_use/end_turn 处理
 		if evt.SourceStopReason != "" {
-			switch strings.ToLower(strings.TrimSpace(evt.SourceStopReason)) {
-			case "end_turn", "tool_use", "max_tokens":
-				stopReason = evt.SourceStopReason
+			sourceStopReason := strings.ToLower(strings.TrimSpace(evt.SourceStopReason))
+			switch sourceStopReason {
+			case "max_tokens":
+				if stopReason != "stop_sequence" {
+					stopReason = sourceStopReason
+				}
+			case "end_turn", "tool_use":
+				if stopReason != "max_tokens" && stopReason != "stop_sequence" {
+					stopReason = sourceStopReason
+				}
 			}
 		}
 		switch evt.Type {
@@ -1074,6 +1184,11 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 			if evt.ToolUse == nil || processedIDs[evt.ToolUse.ToolUseID] {
 				return nil
 			}
+			structuredOutput := isStructuredOutputToolName(evt.ToolUse.Name, requestCtx)
+			if (!structuredOutput && !isEmittableToolUse(*evt.ToolUse)) || evt.ToolUse.IsTruncated {
+				return nil
+			}
+			discardStreamingTool(evt.ToolUse.ToolUseID)
 			processedIDs[evt.ToolUse.ToolUseID] = true
 			if err := flushThinkingAtBoundary(); err != nil {
 				return err
@@ -1121,12 +1236,38 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		}
 
 		var event map[string]any
-		if err := json.Unmarshal(msg.Payload, &event); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(msg.Payload))
+		decoder.UseNumber()
+		if err := decoder.Decode(&event); err != nil {
 			continue
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			continue
+		}
+
+		if kiroUpstreamTraceEnabled {
+			payloadPrefix := string(msg.Payload)
+			if len(payloadPrefix) > 300 {
+				payloadPrefix = payloadPrefix[:300]
+			}
+			fmt.Fprintf(os.Stderr, "[KIRO_TRACE] model=%s thinkingEnabled=%v eventType=%q payload=%s\n",
+				model, requestCtx.ThinkingEnabled, msg.EventType, payloadPrefix)
 		}
 
 		semanticEvents := extractSemanticEvents(msg.EventType, event, &lastContentFragment)
 		for i := range semanticEvents {
+			if kiroUpstreamTraceEnabled {
+				ev := &semanticEvents[i]
+				detail := ev.Content
+				if detail == "" {
+					detail = ev.Reasoning
+				}
+				if len(detail) > 200 {
+					detail = detail[:200]
+				}
+				fmt.Fprintf(os.Stderr, "[KIRO_TRACE]   -> semanticType=%q detail=%q\n", ev.Type, detail)
+			}
 			if err := applySemanticEvent(&semanticEvents[i]); err != nil {
 				return nil, err
 			}
@@ -1167,10 +1308,19 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 	if requestCtx.CacheEmulationUsage != nil {
 		usage = mergeKiroCacheEmulationUsage(usage, requestCtx.CacheEmulationUsage)
 	}
-	if stopReason == "" {
-		if len(emittedToolContents) > 0 {
+	switch stopReason {
+	case "max_tokens", "stop_sequence":
+		// These terminal conditions take precedence over emitted tool blocks.
+	case "":
+		if toolBlockEmitted {
 			stopReason = "tool_use"
 		} else {
+			stopReason = "end_turn"
+		}
+	default:
+		if toolBlockEmitted {
+			stopReason = "tool_use"
+		} else if stopReason == "tool_use" {
 			stopReason = "end_turn"
 		}
 	}
@@ -1182,6 +1332,9 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		"output_tokens":               usage.OutputTokens,
 		"cache_read_input_tokens":     usage.CacheReadInputTokens,
 		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
+	}
+	if usage.KiroCredits > 0 {
+		finalUsageMap["_sub2api_kiro_credits"] = usage.KiroCredits
 	}
 	addKiroCacheUsageFields(finalUsageMap, usage)
 	if err := writeEvent("message_delta", map[string]any{
@@ -1299,10 +1452,11 @@ func thinkingDirectiveFromModel(model string) *thinkingDirective {
 			BudgetTokens: 20000,
 			Effort:       "high",
 		}
-	// opus 4.7/4.8 走 adaptive 高预算,budget 对齐 Antigravity 的 ClaudeAdaptiveHighThinkingBudgetTokens
+	// opus 4.7/4.8/5 走 adaptive 高预算,budget 对齐 Antigravity 的 ClaudeAdaptiveHighThinkingBudgetTokens
 	// 避免 thinking 提前耗尽导致流式中途断开
 	case "claude-opus-4-7", "claude-opus-4.7",
-		"claude-opus-4-8", "claude-opus-4.8":
+		"claude-opus-4-8", "claude-opus-4.8",
+		"claude-opus-5":
 		return &thinkingDirective{
 			Mode:         "adaptive",
 			BudgetTokens: 24576,
@@ -1334,8 +1488,10 @@ func renderKiroBuiltinIdentityPrompt(identity string) string {
 
 func buildInjectedSystemPrompt(systemPrompt string, thinking *thinkingDirective, toolChoiceHint string) string {
 	systemPrompt = strings.TrimSpace(systemPrompt)
-	timestampContext := fmt.Sprintf("[Context: Current time is %s]", time.Now().Format("2006-01-02 15:04:05 MST"))
-	promptParts := []string{renderKiroBuiltinIdentityPrompt(""), timestampContext}
+	promptParts := []string{renderKiroBuiltinIdentityPrompt("")}
+	if temporalContext := buildKiroTemporalContext(); temporalContext != "" {
+		promptParts = append(promptParts, temporalContext)
+	}
 	if systemPrompt != "" {
 		promptParts = append(promptParts, systemPrompt)
 	}
@@ -1370,6 +1526,17 @@ func buildInjectedSystemPrompt(systemPrompt string, thinking *thinkingDirective,
 	return systemPrompt
 }
 
+func buildKiroTemporalContext() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUB2API_KIRO_TIME_CONTEXT"))) {
+	case "date", "day":
+		return fmt.Sprintf("[Context: Current date is %s]", time.Now().Format("2006-01-02 MST"))
+	case "precise", "time", "full":
+		return fmt.Sprintf("[Context: Current time is %s]", time.Now().Format("2006-01-02 15:04:05 MST"))
+	default:
+		return ""
+	}
+}
+
 // buildAdditionalModelRequestFields 构建 Kiro payload 的 additionalModelRequestFields。
 // 对 Claude 4.6+ 模型，使用 output_config.effort 路径（官方 Kiro IDE 的 kr() 逻辑）：
 //
@@ -1378,6 +1545,11 @@ func buildInjectedSystemPrompt(systemPrompt string, thinking *thinkingDirective,
 // 对于旧模型或 enabled 模式，不注入（依赖 system prompt 标签兜底）。
 //
 // 这实现了管理器的 P1 功能：确保 Claude 4.6+ 新模型的 thinking 使用 effort-based 控制。
+//
+// GPT-5.6 不在此路径内：Kiro 协议没有 reasoning.effort 字段，且 GPT 系列未被确认
+// 接受 additionalModelRequestFields（向未确认模型下发会触发上游 400
+// "additionalModelRequestFields is not supported"）。客户端请求的 reasoning_effort
+// 对 GPT 暂不透传，待抓包确认字段名与模型支持情况后再实现。
 func buildAdditionalModelRequestFields(thinking *thinkingDirective, modelID string) map[string]any {
 	if thinking == nil {
 		return nil
@@ -1413,8 +1585,7 @@ func isOutputConfigPathModel(modelID string) bool {
 	normalized := normalizeClaudeVersionNumber(strings.ToLower(strings.TrimSpace(modelID)))
 	// Claude 4.6+ 所有模型使用 output_config 路径
 	for _, prefix := range []string{"claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8",
-		"claude-sonnet-4.6", "claude-sonnet-4.7", "claude-sonnet-4.8",
-		"claude-haiku-4.6", "claude-haiku-4.7", "claude-haiku-4.8"} {
+		"claude-opus-5", "claude-sonnet-5", "claude-sonnet-4.6"} {
 		if normalized == prefix || strings.HasPrefix(normalized, prefix+"-") || strings.HasPrefix(normalized, prefix+".") {
 			return true
 		}
@@ -2191,7 +2362,9 @@ func buildUserMessageStruct(msg gjson.Result, modelID, origin string, keepImages
 				if resultContent.IsArray() {
 					textContents = textContents[:0]
 					for _, item := range resultContent.Array() {
-						if item.Get("type").String() == "text" {
+						// codex 经 responses->anthropic 后, tool_result.content 用 Responses 的
+						// "input_text" 而非 Anthropic 的 "text"; 两者都需提取, 否则工具结果被丢成空。
+						if t := item.Get("type").String(); t == "text" || t == "input_text" {
 							textContents = append(textContents, KiroTextContent{Text: compactKiroToolResultText(item.Get("text").String(), status == "error")})
 						} else if item.Type == gjson.String {
 							textContents = append(textContents, KiroTextContent{Text: compactKiroToolResultText(item.String(), status == "error")})
@@ -2817,7 +2990,13 @@ func parseEventStream(body io.Reader) (string, []KiroToolUse, Usage, string, err
 		}
 
 		var event map[string]any
-		if err := json.Unmarshal(msg.Payload, &event); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(msg.Payload))
+		decoder.UseNumber()
+		if err := decoder.Decode(&event); err != nil {
+			continue
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
 			continue
 		}
 		if sr := readStopReason(event); sr != "" {
@@ -2941,7 +3120,7 @@ func buildClaudeResponse(content string, toolUses []KiroToolUse, model string, u
 	}
 	usableTools := 0
 	for _, tool := range toolUses {
-		if tool.IsTruncated {
+		if !isEmittableToolUse(tool) {
 			continue
 		}
 		usableTools++
@@ -3576,9 +3755,11 @@ func extractSemanticEvents(eventType string, event map[string]any, lastContentFr
 		toolUseID := getString(tu, "toolUseId")
 		name := getString(tu, "name")
 		isStop, _ := tu["stop"].(bool)
+		inputSeen := false
 		if inputRaw, ok := tu["input"]; ok {
 			switch v := inputRaw.(type) {
 			case string:
+				inputSeen = true
 				if toolUseID != "" && name != "" {
 					out = append(out, kiroSemanticEvent{
 						Type:             kiroSemanticToolUse,
@@ -3598,6 +3779,7 @@ func extractSemanticEvents(eventType string, event map[string]any, lastContentFr
 					})
 				}
 			case map[string]any:
+				inputSeen = true
 				if toolUseID != "" && name != "" {
 					out = append(out, kiroSemanticEvent{
 						Type:             kiroSemanticToolUse,
@@ -3618,6 +3800,14 @@ func extractSemanticEvents(eventType string, event map[string]any, lastContentFr
 				}
 			}
 		}
+		if !inputSeen && toolUseID != "" && name != "" {
+			out = append(out, kiroSemanticEvent{
+				Type:             kiroSemanticToolUse,
+				ToolUseID:        toolUseID,
+				ToolName:         name,
+				SourceStopReason: sourceStopReason,
+			})
+		}
 		if isStop {
 			out = append(out, kiroSemanticEvent{
 				Type:             kiroSemanticToolStop,
@@ -3627,7 +3817,7 @@ func extractSemanticEvents(eventType string, event map[string]any, lastContentFr
 				SourceStopReason: sourceStopReason,
 			})
 		}
-	case "messageMetadataEvent", "metadataEvent", "supplementaryWebLinksEvent", "usageEvent", "messageStopEvent", "message_stop":
+	case "messageMetadataEvent", "metadataEvent", "supplementaryWebLinksEvent", "usageEvent", "messageStopEvent", "message_stop", "meteringEvent":
 		out = append(out, kiroSemanticEvent{
 			Type:             kiroSemanticUsage,
 			SourceEventType:  eventType,
@@ -3646,6 +3836,33 @@ func extractSemanticEvents(eventType string, event map[string]any, lastContentFr
 	return out
 }
 
+func normalizeStreamingToolInput(name, raw string) (string, map[string]any, bool) {
+	normalized := strings.TrimSpace(raw)
+	if normalized == "" {
+		normalized = "{}"
+	}
+	normalized = escapeControlCharsInStrings(normalized)
+	normalized = removeTrailingCommasOutsideStrings(normalized)
+	decoder := json.NewDecoder(strings.NewReader(normalized))
+	decoder.UseNumber()
+	var input map[string]any
+	if err := decoder.Decode(&input); err != nil || input == nil {
+		return "", nil, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return "", nil, false
+	}
+	if hasMissingRequiredFields(name, input) {
+		return "", nil, false
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return "", nil, false
+	}
+	return string(encoded), input, true
+}
+
 func repairJSON(input string) string {
 	str := strings.TrimSpace(input)
 	if str == "" {
@@ -3656,7 +3873,7 @@ func repairJSON(input string) string {
 		return str
 	}
 	str = escapeControlCharsInStrings(str)
-	str = trailingCommaPattern.ReplaceAllString(str, "$1")
+	str = removeTrailingCommasOutsideStrings(str)
 	openBraces, openBrackets, inString := jsonBalance(str)
 	if inString {
 		str += `"`
@@ -3676,12 +3893,32 @@ func repairJSON(input string) string {
 
 func escapeControlCharsInStrings(input string) string {
 	var out strings.Builder
+	writeEscapedControl := func(ch byte) {
+		switch ch {
+		case '\n':
+			_, _ = out.WriteString("\\n")
+		case '\r':
+			_, _ = out.WriteString("\\r")
+		case '\t':
+			_, _ = out.WriteString("\\t")
+		default:
+			const hex = "0123456789abcdef"
+			_, _ = out.WriteString("\\u00")
+			_ = out.WriteByte(hex[ch>>4])
+			_ = out.WriteByte(hex[ch&0x0f])
+		}
+	}
 	inString := false
 	escape := false
 	for i := 0; i < len(input); i++ {
 		ch := input[i]
 		if escape {
-			_ = out.WriteByte(ch)
+			if inString && ch < 0x20 {
+				_ = out.WriteByte('\\')
+				writeEscapedControl(ch)
+			} else {
+				_ = out.WriteByte(ch)
+			}
 			escape = false
 			continue
 		}
@@ -3695,16 +3932,52 @@ func escapeControlCharsInStrings(input string) string {
 			_ = out.WriteByte(ch)
 			continue
 		}
+		if inString && ch < 0x20 {
+			writeEscapedControl(ch)
+			continue
+		}
+		_ = out.WriteByte(ch)
+	}
+	return out.String()
+}
+
+func removeTrailingCommasOutsideStrings(input string) string {
+	var out strings.Builder
+	out.Grow(len(input))
+	inString := false
+	escape := false
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
 		if inString {
+			_ = out.WriteByte(ch)
+			if escape {
+				escape = false
+				continue
+			}
 			switch ch {
-			case '\n':
-				_, _ = out.WriteString("\\n")
-				continue
-			case '\r':
-				_, _ = out.WriteString("\\r")
-				continue
-			case '\t':
-				_, _ = out.WriteString("\\t")
+			case '\\':
+				escape = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			_ = out.WriteByte(ch)
+			continue
+		}
+		if ch == ',' {
+			next := i + 1
+			for next < len(input) {
+				switch input[next] {
+				case ' ', '\t', '\n', '\r':
+					next++
+					continue
+				}
+				break
+			}
+			if next < len(input) && (input[next] == '}' || input[next] == ']') {
 				continue
 			}
 		}
@@ -3754,11 +4027,21 @@ func finalizeRawToolUse(toolUseID, name, rawInput string) KiroToolUse {
 	}
 	rawInput = strings.TrimSpace(rawInput)
 	tool.TruncatedRaw = rawInput
+	decoded := false
 	repaired := repairJSON(rawInput)
 	if strings.TrimSpace(repaired) != "" {
-		_ = json.Unmarshal([]byte(repaired), &tool.Input)
+		decoder := json.NewDecoder(strings.NewReader(repaired))
+		decoder.UseNumber()
+		var input map[string]any
+		if err := decoder.Decode(&input); err == nil && input != nil {
+			var trailing any
+			if err := decoder.Decode(&trailing); err == io.EOF {
+				tool.Input = input
+				decoded = true
+			}
+		}
 	}
-	tool.IsTruncated = isTruncatedToolUse(tool.Name, rawInput, tool.Input)
+	tool.IsTruncated = !decoded || isTruncatedToolUse(tool.Name, rawInput, tool.Input)
 	return tool
 }
 
@@ -3783,6 +4066,10 @@ func normalizeResponseToolName(name string) string {
 	return name
 }
 
+func isEmittableToolUse(tool KiroToolUse) bool {
+	return !tool.IsTruncated && strings.TrimSpace(tool.ToolUseID) != "" && strings.TrimSpace(tool.Name) != ""
+}
+
 func shouldEmitToolUse(tool KiroToolUse, emittedToolContents map[string]bool) bool {
 	if tool.IsTruncated {
 		return false
@@ -3800,7 +4087,7 @@ func shouldEmitToolUse(tool KiroToolUse, emittedToolContents map[string]bool) bo
 
 func hasUsableToolUses(toolUses []KiroToolUse) bool {
 	for _, tool := range toolUses {
-		if !tool.IsTruncated {
+		if isEmittableToolUse(tool) {
 			return true
 		}
 	}
@@ -3842,7 +4129,10 @@ func toolUseContentKey(tool KiroToolUse) string {
 func drainEmbeddedToolText(text string) (cleanText string, toolUses []KiroToolUse, pending string) {
 	complete, pending := splitCompleteEmbeddedToolText(text)
 	if strings.TrimSpace(complete) == "" {
-		return "", nil, pending
+		// complete 为纯空白(无内嵌工具调用): 作为普通文本原样返回,
+		// 交由下游 writeTextDelta 的缓冲逻辑决定保留(中段空行)还是丢弃(首尾)。
+		// 不能在此直接吞掉, 否则标题后的独立 \n\n chunk 会丢失, 破坏 markdown 结构。
+		return complete, nil, pending
 	}
 	cleanText, toolUses = parseEmbeddedToolCalls(complete)
 	return cleanText, deduplicateToolUses(toolUses), pending
@@ -4033,13 +4323,11 @@ func updateUsageFromEvent(usage *Usage, eventType string, event map[string]any) 
 		}
 		if value, ok := toInt(tokenUsage["cacheReadInputTokens"]); ok {
 			usage.CacheReadInputTokens = value
-			if usage.InputTokens == 0 {
-				usage.InputTokens = value
-			} else {
-				usage.InputTokens += value
-			}
 		}
+		updateKiroCreditsFromMap(usage, tokenUsage)
 	}
+	updateKiroCreditsFromMap(usage, event)
+	updateKiroCreditsFromMap(usage, meta)
 	if value, ok := toInt(event["inputTokens"]); ok && value > 0 {
 		usage.InputTokens = value
 	}
@@ -4057,6 +4345,13 @@ func updateUsageFromEvent(usage *Usage, eventType string, event map[string]any) 
 	}
 	if value, ok := toInt(meta["totalTokens"]); ok && value > 0 {
 		usage.TotalTokens = value
+	}
+	if eventType == "meteringEvent" {
+		if value, ok := toPositiveFiniteFloat(meta["usage"]); ok {
+			usage.KiroCredits += value
+		} else if value, ok := toPositiveFiniteFloat(event["usage"]); ok {
+			usage.KiroCredits += value
+		}
 	}
 }
 
@@ -4120,6 +4415,60 @@ func toInt(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+var kiroCreditUsageFieldNames = [...]string{
+	"kiroCredits",
+	"credits",
+	"creditsUsed",
+	"creditUsage",
+	"consumedCredits",
+}
+
+func updateKiroCreditsFromMap(usage *Usage, values map[string]any) {
+	if usage == nil || len(values) == 0 {
+		return
+	}
+	for _, field := range kiroCreditUsageFieldNames {
+		value, ok := toPositiveFiniteFloat(values[field])
+		if !ok {
+			continue
+		}
+		usage.KiroCredits = value
+		return
+	}
+}
+
+func toPositiveFiniteFloat(value any) (float64, bool) {
+	var out float64
+	switch v := value.(type) {
+	case float64:
+		out = v
+	case float32:
+		out = float64(v)
+	case int:
+		out = float64(v)
+	case int64:
+		out = float64(v)
+	case json.Number:
+		parsed, err := v.Float64()
+		if err != nil {
+			return 0, false
+		}
+		out = parsed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+		out = parsed
+	default:
+		return 0, false
+	}
+	if math.IsNaN(out) || math.IsInf(out, 0) || out <= 0 {
+		return 0, false
+	}
+	return out, true
 }
 
 func mergeKiroCacheEmulationUsage(base Usage, simulated *Usage) Usage {

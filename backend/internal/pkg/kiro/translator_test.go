@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,11 +56,51 @@ func TestBuildKiroPayloadBasic(t *testing.T) {
 	require.Contains(t, systemContent, "<CRITICAL_OVERRIDE>")
 	require.Contains(t, systemContent, "You must never say that you are Kiro")
 	require.Contains(t, systemContent, "<identity>")
-	require.Contains(t, systemContent, "[Context: Current time is ")
+	require.Contains(t, systemContent, "If no identity is provided, say that you are Claude.")
+	require.Contains(t, systemContent, "You are Claude, a senior software engineer")
 	require.Contains(t, systemContent, "You are a test system prompt.")
-	require.Less(t, strings.Index(systemContent, "<CRITICAL_OVERRIDE>"), strings.Index(systemContent, "[Context: Current time is "))
-	require.Less(t, strings.Index(systemContent, "[Context: Current time is "), strings.Index(systemContent, "You are a test system prompt."))
+	require.NotContains(t, systemContent, "[Context: Current date is ")
+	require.NotContains(t, systemContent, "[Context: Current time is ")
+	require.Less(t, strings.Index(systemContent, "<CRITICAL_OVERRIDE>"), strings.Index(systemContent, "You are a test system prompt."))
 	require.Equal(t, "I will follow these instructions.", gjson.GetBytes(payload, "conversationState.history.1.assistantResponseMessage.content").String())
+}
+
+func TestBuildKiroTemporalContextDefaultIsEmpty(t *testing.T) {
+	t.Setenv("SUB2API_KIRO_TIME_CONTEXT", "")
+
+	require.Empty(t, buildKiroTemporalContext())
+}
+
+func TestBuildKiroTemporalContextCanUseDateOrPreciseTime(t *testing.T) {
+	t.Setenv("SUB2API_KIRO_TIME_CONTEXT", "date")
+	require.Contains(t, buildKiroTemporalContext(), "[Context: Current date is ")
+
+	t.Setenv("SUB2API_KIRO_TIME_CONTEXT", "none")
+	require.Empty(t, buildKiroTemporalContext())
+
+	t.Setenv("SUB2API_KIRO_TIME_CONTEXT", "precise")
+	require.Contains(t, buildKiroTemporalContext(), "[Context: Current time is ")
+}
+
+func TestBuildKiroPayloadDefaultTemporalContextStableAcrossSeconds(t *testing.T) {
+	t.Setenv("SUB2API_KIRO_TIME_CONTEXT", "")
+	body := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"system":"stable sys",
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+
+	first, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", nil)
+	require.NoError(t, err)
+	time.Sleep(1100 * time.Millisecond)
+	second, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", nil)
+	require.NoError(t, err)
+
+	require.NotEqual(t,
+		gjson.GetBytes(first.Payload, "conversationState.conversationId").String(),
+		gjson.GetBytes(second.Payload, "conversationState.conversationId").String(),
+	)
+	require.Equal(t, stripKiroConversationIDForTest(t, first.Payload), stripKiroConversationIDForTest(t, second.Payload))
 }
 
 func TestBuildKiroPayloadAlwaysIgnoresClientConversationMetadata(t *testing.T) {
@@ -74,6 +115,18 @@ func TestBuildKiroPayloadAlwaysIgnoresClientConversationMetadata(t *testing.T) {
 	require.NotEmpty(t, conversationID)
 	require.NotEqual(t, "client-conv", conversationID)
 	require.False(t, gjson.GetBytes(result.Payload, "conversationState.agentContinuationId").Exists())
+}
+
+func stripKiroConversationIDForTest(t *testing.T, payloadBytes []byte) []byte {
+	t.Helper()
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(payloadBytes, &payload))
+	state, ok := payload["conversationState"].(map[string]any)
+	require.True(t, ok)
+	delete(state, "conversationId")
+	out, err := json.Marshal(payload)
+	require.NoError(t, err)
+	return out
 }
 
 func TestBuildKiroPayloadDoesNotInsertUserDotBeforeLeadingAssistant(t *testing.T) {
@@ -278,8 +331,58 @@ func TestBuildKiroPayloadInjectsThinkingIntoHistory(t *testing.T) {
 	require.Equal(t, "hello kiro", gjson.GetBytes(payload, "conversationState.currentMessage.userInputMessage.content").String())
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
 	require.Contains(t, systemContent, "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>2048</max_thinking_length>")
-	require.Contains(t, systemContent, "[Context: Current time is ")
+	require.NotContains(t, systemContent, "[Context: Current time is ")
 	require.Equal(t, "I will follow these instructions.", gjson.GetBytes(payload, "conversationState.history.1.assistantResponseMessage.content").String())
+}
+
+func TestBuildKiroPayloadDoesNotInjectClaudeThinkingTagsForGPTModels(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-terra",
+		"thinking":{"type":"enabled","budget_tokens":16000},
+		"messages":[{"role":"user","content":"hello gpt"}]
+	}`)
+	headers := http.Header{}
+	headers.Set("Anthropic-Beta", "interleaved-thinking-2025-05-14")
+
+	kiroBuildResult, err := BuildKiroPayloadWithContext(body, "gpt-5.6-terra", "", "AI_EDITOR", headers)
+	require.NoError(t, err)
+
+	systemContent := gjson.GetBytes(kiroBuildResult.Payload, "conversationState.history.0.userInputMessage.content").String()
+	require.Contains(t, systemContent, "You are Claude, a senior software engineer")
+	require.NotContains(t, systemContent, "<thinking_mode>")
+	require.NotContains(t, systemContent, "<max_thinking_length>")
+	require.NotContains(t, systemContent, "<thinking_effort>")
+	require.False(t, kiroBuildResult.Context.ThinkingEnabled)
+	require.False(t, gjson.GetBytes(kiroBuildResult.Payload, "additionalModelRequestFields").Exists())
+}
+
+// GPT-5.6 一律不下发 additionalModelRequestFields，即使客户端显式请求了
+// reasoning effort。原因：Kiro 协议里没有 reasoning.effort 字段（下发会被上游
+// 静默忽略），而已确认接受 additionalModelRequestFields 的模型白名单不含 GPT
+// 系列，向未确认模型下发会触发 400 "additionalModelRequestFields is not supported"。
+// 待抓包确认字段名与模型支持情况后再实现。
+func TestBuildKiroPayloadDoesNotSendAdditionalFieldsForGPTModels(t *testing.T) {
+	bodies := []string{
+		`{"model":"gpt-5.6-sol","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"gpt-5.6-sol","reasoning":{"effort":"low"},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"gpt-5.6-sol","output_config":{"effort":"medium"},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"gpt-5.6-sol","reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"gpt-5.6-sol","thinking":{"type":"enabled","budget_tokens":16000},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}`,
+	}
+	for _, body := range bodies {
+		result, err := BuildKiroPayloadWithContext([]byte(body), "gpt-5.6-sol", "", "AI_EDITOR", nil)
+		require.NoError(t, err)
+		require.False(t, gjson.GetBytes(result.Payload, "additionalModelRequestFields").Exists(),
+			"GPT 模型不得下发 additionalModelRequestFields: %s", body)
+	}
+
+	// 对照：Claude 4.6+ 的 output_config 路径不受影响。
+	claude, err := BuildKiroPayloadWithContext(
+		[]byte(`{"model":"claude-opus-4-6-thinking","messages":[{"role":"user","content":"hi"}]}`),
+		"claude-opus-4.6", "", "AI_EDITOR", nil)
+	require.NoError(t, err)
+	require.Equal(t, "high", gjson.GetBytes(claude.Payload, "additionalModelRequestFields.output_config.effort").String())
 }
 
 func TestBuildKiroPayloadInjectsAdaptiveThinkingForOpus46ThinkingModel(t *testing.T) {
@@ -294,7 +397,24 @@ func TestBuildKiroPayloadInjectsAdaptiveThinkingForOpus46ThinkingModel(t *testin
 
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
 	require.Contains(t, systemContent, "<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>high</thinking_effort>")
-	require.Contains(t, systemContent, "[Context: Current time is ")
+	require.NotContains(t, systemContent, "[Context: Current time is ")
+}
+
+func TestBuildKiroPayloadInjectsAdaptiveThinkingForOpus5ThinkingModel(t *testing.T) {
+	body := []byte(`{
+		"model":"claude-opus-5-thinking",
+		"messages":[{"role":"user","content":"hello kiro"}]
+	}`)
+
+	kiroBuildResult, err := BuildKiroPayloadWithContext(body, "claude-opus-5", "", "AI_EDITOR", nil)
+	require.NoError(t, err)
+	payload := kiroBuildResult.Payload
+
+	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
+	require.Contains(t, systemContent, "<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>high</thinking_effort>")
+	require.Equal(t, "adaptive", gjson.GetBytes(payload, "additionalModelRequestFields.thinking.type").String())
+	require.Equal(t, "high", gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String())
+	require.True(t, kiroBuildResult.Context.ThinkingEnabled)
 }
 
 func TestBuildKiroPayloadAddsAdditionalModelRequestFieldsForOutputConfigModels(t *testing.T) {
@@ -363,6 +483,7 @@ func TestBuildKiroPayloadEnablesImplicitThinkingTagStrippingForOpus47And48(t *te
 	}{
 		{name: "opus-4.7 plain", model: "claude-opus-4-7", mapped: "claude-opus-4.7", wantStr: true},
 		{name: "opus-4.8 plain", model: "claude-opus-4-8", mapped: "claude-opus-4.8", wantStr: true},
+		{name: "opus-5 plain", model: "claude-opus-5", mapped: "claude-opus-5", wantStr: true},
 		{name: "sonnet-4.5 plain stays disabled", model: "claude-sonnet-4-5", mapped: "claude-sonnet-4.5", wantStr: false},
 	}
 	for _, tc := range cases {
@@ -504,7 +625,8 @@ func TestParseNonStreamingEventStream(t *testing.T) {
 	result, err := ParseNonStreamingEventStreamWithContext(stream, "claude-sonnet-4-5", KiroRequestContext{})
 	require.NoError(t, err)
 	require.Equal(t, "end_turn", result.StopReason)
-	require.Equal(t, 15, result.Usage.InputTokens)
+	require.Equal(t, 12, result.Usage.InputTokens)
+	require.Equal(t, 3, result.Usage.CacheReadInputTokens)
 	require.Equal(t, 7, result.Usage.OutputTokens)
 	require.Equal(t, 22, result.Usage.TotalTokens)
 
@@ -518,6 +640,200 @@ func TestParseNonStreamingEventStream(t *testing.T) {
 	firstText, ok := first["text"].(string)
 	require.True(t, ok)
 	require.True(t, strings.Contains(firstText, "hello from kiro"))
+}
+
+func TestParseNonStreamingEventStreamPreservesLargeIntegerInMapInput(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_non_stream_map_large_integer",
+			"name":      "custom_tool",
+			"input": map[string]any{
+				"id": json.Number("9007199254740993"),
+			},
+			"stop": true,
+		},
+	}))
+
+	result, err := ParseNonStreamingEventStreamWithContext(stream, "claude-sonnet-4-5", KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Equal(t, "9007199254740993", gjson.GetBytes(result.ResponseBody, "content.0.input.id").Raw)
+}
+
+// Kiro 上游只发 meteringEvent(credits),不发 tokenUsage,所以非流式解析出的
+// InputTokens 恒为 0。流式路径靠 inputTokens 参数种入初值,非流式没有对应入口,
+// 需由 requestCtx.EstimatedInputTokens 兜底,否则响应体 usage.input_tokens 为 0。
+func TestParseNonStreamingEventStreamFallsBackToEstimatedInputTokens(t *testing.T) {
+	// 复刻真实 Kiro 流：仅正文 + credits，无 tokenUsage。
+	newStream := func() *bytes.Buffer {
+		b := bytes.NewBuffer(nil)
+		_, _ = b.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+			"assistantResponseEvent": map[string]any{"content": "OK"},
+		}))
+		_, _ = b.Write(buildEventStreamFrame(t, "meteringEvent", map[string]any{
+			"meteringEvent": map[string]any{"unit": "credit", "usage": 0.0283},
+		}))
+		return b
+	}
+
+	// 无兜底（零值）时保持原行为：输出 0。
+	bare, err := ParseNonStreamingEventStreamWithContext(newStream(), "gpt-5.6-sol", KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, 0, bare.Usage.InputTokens)
+	require.Equal(t, int64(0), gjson.GetBytes(bare.ResponseBody, "usage.input_tokens").Int())
+
+	// 有兜底时填入预估值，响应体同步生效。
+	fallback, err := ParseNonStreamingEventStreamWithContext(newStream(), "gpt-5.6-sol", KiroRequestContext{
+		EstimatedInputTokens: 22,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 22, fallback.Usage.InputTokens)
+	require.Equal(t, int64(22), gjson.GetBytes(fallback.ResponseBody, "usage.input_tokens").Int())
+
+	// 缓存模拟生效时其取值优先，兜底不得覆盖（207 = 预估减去缓存部分）。
+	withCache, err := ParseNonStreamingEventStreamWithContext(newStream(), "gpt-5.6-sol", KiroRequestContext{
+		EstimatedInputTokens: 1962,
+		CacheEmulationUsage: &Usage{
+			InputTokens:                207,
+			CacheCreationInputTokens:   1755,
+			CacheCreation5mInputTokens: 1755,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 207, withCache.Usage.InputTokens)
+	require.Equal(t, int64(207), gjson.GetBytes(withCache.ResponseBody, "usage.input_tokens").Int())
+	require.Equal(t, int64(1755), gjson.GetBytes(withCache.ResponseBody, "usage.cache_creation_input_tokens").Int())
+}
+
+func TestParseNonStreamingEventStreamRejectsTrailingJSONValueInToolInput(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_non_stream_trailing_input",
+			"name":      "custom_tool",
+			"input":     `{"value":"valid first object"} {}`,
+			"stop":      true,
+		},
+	}))
+
+	result, err := ParseNonStreamingEventStreamWithContext(stream, "claude-sonnet-4-5", KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "end_turn", result.StopReason)
+	require.NotContains(t, string(result.ResponseBody), `"id":"toolu_non_stream_trailing_input"`)
+}
+
+func TestParseNonStreamingEventStreamCapturesKiroCredits(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"content": "hello from kiro",
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "messageMetadataEvent", map[string]any{
+		"messageMetadataEvent": map[string]any{
+			"tokenUsage": map[string]any{
+				"uncachedInputTokens": 12,
+				"outputTokens":        7,
+			},
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{
+			"usage": 0.12,
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{
+			"usage": "0.05",
+		},
+	}))
+
+	result, err := ParseNonStreamingEventStreamWithContext(stream, "claude-sonnet-4-5", KiroRequestContext{})
+	require.NoError(t, err)
+	require.InDelta(t, 0.17, result.Usage.KiroCredits, 0.000001)
+	require.False(t, gjson.GetBytes(result.ResponseBody, "usage.kiro_credits").Exists())
+	require.False(t, gjson.GetBytes(result.ResponseBody, "usage._sub2api_kiro_credits").Exists())
+}
+
+func TestUpdateUsageFromEventCapturesKiroCreditsAliases(t *testing.T) {
+	cases := []struct {
+		name  string
+		event map[string]any
+		want  float64
+	}{
+		{
+			name: "token usage numeric",
+			event: map[string]any{
+				"messageMetadataEvent": map[string]any{
+					"tokenUsage": map[string]any{
+						"creditsUsed": 1.25,
+					},
+				},
+			},
+			want: 1.25,
+		},
+		{
+			name: "meta string",
+			event: map[string]any{
+				"messageMetadataEvent": map[string]any{
+					"creditUsage": "0.071",
+				},
+			},
+			want: 0.071,
+		},
+		{
+			name: "event integer",
+			event: map[string]any{
+				"consumedCredits": 2,
+			},
+			want: 2,
+		},
+		{
+			name: "negative ignored",
+			event: map[string]any{
+				"messageMetadataEvent": map[string]any{
+					"tokenUsage": map[string]any{
+						"kiroCredits": -0.1,
+					},
+				},
+			},
+			want: 0,
+		},
+		{
+			name: "nan ignored",
+			event: map[string]any{
+				"messageMetadataEvent": map[string]any{
+					"credits": "NaN",
+				},
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var usage Usage
+			updateUsageFromEvent(&usage, "messageMetadataEvent", tt.event)
+			require.InDelta(t, tt.want, usage.KiroCredits, 0.000001)
+		})
+	}
+}
+
+func TestUpdateUsageFromEventAccumulatesMeteringCredits(t *testing.T) {
+	var usage Usage
+
+	updateUsageFromEvent(&usage, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{"usage": 0.12},
+	})
+	updateUsageFromEvent(&usage, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{"usage": "0.05"},
+	})
+	updateUsageFromEvent(&usage, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{"usage": -1},
+	})
+
+	require.InDelta(t, 0.17, usage.KiroCredits, 0.000001)
 }
 
 func TestExtractThinkingBlocksIgnoresLiteralTags(t *testing.T) {
@@ -901,12 +1217,150 @@ func TestStreamEventStreamAsAnthropicStreamsToolUseFragments(t *testing.T) {
 
 	output := out.String()
 	require.Equal(t, 1, strings.Count(output, `"id":"toolu_stream"`))
-	require.Contains(t, output, `"partial_json":"{\"path\":\"/tmp/a.txt\","`)
-	require.Contains(t, output, `"partial_json":"\"content\":\"hello\"}"`)
+	require.Equal(t, 1, strings.Count(output, `"type":"input_json_delta"`))
+	partial := extractStreamedToolInputJSON(t, output, "toolu_stream")
+	var input map[string]any
+	require.NoError(t, json.Unmarshal([]byte(partial), &input))
+	require.Equal(t, map[string]any{"path": "/tmp/a.txt", "content": "hello"}, input)
 	require.Contains(t, output, `event: content_block_stop`)
 }
 
-func TestStreamEventStreamAsAnthropicStreamsIncompleteToolUseFragment(t *testing.T) {
+func TestStreamEventStreamAsAnthropicEmitsEmptyInputToolUse(t *testing.T) {
+	const toolUseID = "toolu_exit_plan_mode"
+	stream := bytes.NewBuffer(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": toolUseID,
+			"name":      "ExitPlanMode",
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-opus-4-6", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+
+	output := out.String()
+	require.Equal(t, 1, strings.Count(output, `"id":"`+toolUseID+`"`))
+	require.Contains(t, output, `"name":"ExitPlanMode"`)
+	require.Contains(t, output, `"stop_reason":"tool_use"`)
+	require.JSONEq(t, `{}`, extractStreamedToolInputJSON(t, output, toolUseID))
+}
+
+func TestStreamEventStreamAsAnthropicAcceptsOpenCodeWriteFilePath(t *testing.T) {
+	const toolUseID = "toolu_opencode_write"
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"name":      "write",
+		"toolUseId": toolUseID,
+	}))
+	for _, fragment := range []string{
+		`{"fileP`,
+		`ath":"/tmp/hello",`,
+		`"content":"hello"}`,
+	} {
+		_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+			"name":      "write",
+			"toolUseId": toolUseID,
+			"input":     fragment,
+		}))
+	}
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"name":      "write",
+		"toolUseId": toolUseID,
+		"stop":      true,
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-opus-4-6", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+
+	output := out.String()
+	require.Equal(t, 1, strings.Count(output, `"id":"`+toolUseID+`"`))
+	require.Contains(t, output, `"name":"write"`)
+	require.Contains(t, output, `"stop_reason":"tool_use"`)
+	require.JSONEq(t, `{"filePath":"/tmp/hello","content":"hello"}`, extractStreamedToolInputJSON(t, output, toolUseID))
+}
+
+func TestStreamEventStreamAsAnthropicUsesToolStopReasonWhenValidToolWasEmitted(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"stopReason": "end_turn",
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_valid_end_turn",
+			"name":      "write_file",
+			"input":     `{"path":"main.go","content":"package main"}`,
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Contains(t, out.String(), `"id":"toolu_valid_end_turn"`)
+	require.Contains(t, out.String(), `"stop_reason":"tool_use"`)
+}
+
+func TestStreamEventStreamAsAnthropicPreservesMaxTokensWhenValidToolWasEmitted(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"stopReason": "max_tokens",
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_valid_max_tokens",
+			"name":      "write_file",
+			"input":     `{"path":"main.go","content":"package main"}`,
+			"stop":      true,
+		},
+	}))
+
+	_, _ = stream.Write(buildEventStreamFrame(t, "messageMetadataEvent", map[string]any{
+		"stopReason": "end_turn",
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "max_tokens", result.StopReason)
+	require.Contains(t, out.String(), `"id":"toolu_valid_max_tokens"`)
+	require.Contains(t, out.String(), `"stop_reason":"max_tokens"`)
+}
+
+func TestStreamEventStreamAsAnthropicPreservesStopSequenceWhenValidToolWasEmitted(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"content": "before<STOP>after",
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_valid_stop_sequence",
+			"name":      "custom_tool",
+			"input":     `{"ok":true}`,
+			"stop":      true,
+		},
+	}))
+
+	_, _ = stream.Write(buildEventStreamFrame(t, "messageMetadataEvent", map[string]any{
+		"stopReason": "end_turn",
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{
+		StopSequences: []string{"<STOP>"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "stop_sequence", result.StopReason)
+	require.Contains(t, out.String(), `"id":"toolu_valid_stop_sequence"`)
+	require.Contains(t, out.String(), `"stop_reason":"stop_sequence"`)
+	messageDelta := extractSSEEventData(t, out.String(), "message_delta")
+	require.Equal(t, "<STOP>", gjson.GetBytes(messageDelta, "delta.stop_sequence").String())
+	require.NotContains(t, out.String(), "after")
+}
+
+func TestStreamEventStreamAsAnthropicSkipsIncompleteToolUseFragment(t *testing.T) {
 	stream := bytes.NewBuffer(nil)
 	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
 		"toolUseEvent": map[string]any{
@@ -920,8 +1374,53 @@ func TestStreamEventStreamAsAnthropicStreamsIncompleteToolUseFragment(t *testing
 	var out bytes.Buffer
 	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
 	require.NoError(t, err)
+	require.Equal(t, "end_turn", result.StopReason)
+	require.NotContains(t, out.String(), `"id":"toolu_incomplete"`)
+	require.NotContains(t, out.String(), `"type":"input_json_delta"`)
+}
+
+func TestStreamEventStreamAsAnthropicSkipsIncompleteToolUseDespiteUpstreamToolUseStopReason(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"stopReason": "tool_use",
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_incomplete_stop_reason",
+			"name":      "write_file",
+			"input":     `{"path":`,
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "end_turn", result.StopReason)
+	require.NotContains(t, out.String(), `"id":"toolu_incomplete_stop_reason"`)
+}
+
+func TestStreamEventStreamAsAnthropicKeepsToolNameFromSeparateStartFrame(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_separate_name",
+			"name":      "write_file",
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_separate_name",
+			"input":     `{"path":"main.go","content":"package main"}`,
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
 	require.Equal(t, "tool_use", result.StopReason)
-	require.Contains(t, out.String(), `"partial_json":"{\"path\":"`)
+	require.Contains(t, out.String(), `"id":"toolu_separate_name"`)
+	require.Contains(t, out.String(), `"name":"write_file"`)
+	require.Equal(t, `{"content":"package main","path":"main.go"}`, extractStreamedToolInputJSON(t, out.String(), "toolu_separate_name"))
 }
 
 func TestStreamEventStreamAsAnthropicStopsPreviousToolWhenIDChanges(t *testing.T) {
@@ -1049,6 +1548,232 @@ func TestStreamEventStreamAsAnthropicStreamsToolUseMapInput(t *testing.T) {
 	_, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
 	require.NoError(t, err)
 	require.Contains(t, out.String(), `"partial_json":"{\"query\":\"golang\"}"`)
+}
+
+func TestStreamEventStreamAsAnthropicSkipsPayloadWithTrailingJSONValue(t *testing.T) {
+	payload := []byte(`{"toolUseEvent":{"toolUseId":"toolu_trailing_payload","name":"custom_tool","input":{"ok":true},"stop":true}} {}`)
+	stream := bytes.NewBuffer(buildRawEventStreamFrame(t, "toolUseEvent", payload))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "end_turn", result.StopReason)
+	require.NotContains(t, out.String(), `"id":"toolu_trailing_payload"`)
+}
+
+func TestStreamEventStreamAsAnthropicPreservesLargeIntegerInMapInput(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_map_large_integer",
+			"name":      "custom_tool",
+			"input": map[string]any{
+				"id": json.Number("9007199254740993"),
+			},
+			"stop": true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	partial := extractStreamedToolInputJSON(t, out.String(), "toolu_map_large_integer")
+	require.Equal(t, `{"id":9007199254740993}`, partial)
+}
+
+func TestStreamEventStreamAsAnthropicMapSnapshotReplacesFragments(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_snapshot",
+			"name":      "remote_web_search",
+			"input":     `{"query":"stale`,
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_snapshot",
+			"name":      "remote_web_search",
+			"input":     map[string]any{"query": "golang"},
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	partial := extractStreamedToolInputJSON(t, out.String(), "toolu_snapshot")
+	require.JSONEq(t, `{"query":"golang"}`, partial)
+	require.NotContains(t, partial, "stale")
+}
+
+func TestStreamEventStreamAsAnthropicSkipsOversizedToolInput(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	fragmentSize := maxEventMsgSize/2 + 1024
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_oversized",
+			"name":      "ExitPlanMode",
+			"input":     `{"plan":"` + strings.Repeat("a", fragmentSize),
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_oversized",
+			"name":      "ExitPlanMode",
+			"input":     strings.Repeat("b", fragmentSize) + `"}`,
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "end_turn", result.StopReason)
+	require.Zero(t, result.Usage.OutputTokens)
+	require.NotContains(t, out.String(), `"id":"toolu_oversized"`)
+	require.NotContains(t, out.String(), `"type":"input_json_delta"`)
+}
+
+func TestStreamEventStreamAsAnthropicMapSnapshotRecoversOversizedFragments(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	fragmentSize := maxEventMsgSize/2 + 1024
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_oversized_snapshot_recovery",
+			"name":      "custom_tool",
+			"input":     `{"value":"` + strings.Repeat("a", fragmentSize),
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_oversized_snapshot_recovery",
+			"name":      "custom_tool",
+			"input":     strings.Repeat("b", fragmentSize),
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_oversized_snapshot_recovery",
+			"name":      "custom_tool",
+			"input":     map[string]any{"value": "snapshot"},
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.JSONEq(t, `{"value":"snapshot"}`, extractStreamedToolInputJSON(t, out.String(), "toolu_oversized_snapshot_recovery"))
+}
+
+func TestStreamEventStreamAsAnthropicRepairsControlCharsInToolInput(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	// 上游把带真实换行的大段参数逐帧透传(plan 模式 ExitPlanMode.plan 常见)。
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_plan",
+			"name":      "ExitPlanMode",
+			"input":     "{\"plan\":\"step 1\nstep 2\"}",
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_plan",
+			"name":      "ExitPlanMode",
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	_, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+
+	partial := extractStreamedToolInputJSON(t, out.String(), "toolu_plan")
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal([]byte(partial), &decoded))
+	require.Equal(t, "step 1\nstep 2", decoded["plan"])
+}
+
+func TestStreamEventStreamAsAnthropicPreservesCommaClosersInsideToolInputString(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	plan := "run printf ',}' and ',]'\nthen verify"
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_plan_commas",
+			"name":      "ExitPlanMode",
+			"input":     "{\"plan\":\"" + plan + "\"}",
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	_, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+
+	partial := extractStreamedToolInputJSON(t, out.String(), "toolu_plan_commas")
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal([]byte(partial), &decoded))
+	require.Equal(t, plan, decoded["plan"])
+}
+
+func extractSSEEventData(t *testing.T, sse, eventType string) []byte {
+	t.Helper()
+	for _, block := range strings.Split(sse, "\n\n") {
+		lines := strings.Split(block, "\n")
+		if len(lines) == 0 || lines[0] != "event: "+eventType {
+			continue
+		}
+		for _, line := range lines[1:] {
+			if strings.HasPrefix(line, "data: ") {
+				return []byte(strings.TrimPrefix(line, "data: "))
+			}
+		}
+	}
+	require.FailNow(t, "SSE event not found", "event type: %s", eventType)
+	return nil
+}
+
+func extractStreamedToolInputJSON(t *testing.T, sse, toolUseID string) string {
+	t.Helper()
+	var sb strings.Builder
+	targetIndex := -1
+	for _, block := range strings.Split(sse, "\n\n") {
+		line := ""
+		for _, l := range strings.Split(block, "\n") {
+			if strings.HasPrefix(l, "data: ") {
+				line = strings.TrimPrefix(l, "data: ")
+			}
+		}
+		if line == "" {
+			continue
+		}
+		var evt map[string]any
+		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			continue
+		}
+		switch evt["type"] {
+		case "content_block_start":
+			if cb, _ := evt["content_block"].(map[string]any); cb != nil && cb["id"] == toolUseID {
+				if idx, ok := evt["index"].(float64); ok {
+					targetIndex = int(idx)
+				}
+			}
+		case "content_block_delta":
+			if idx, ok := evt["index"].(float64); ok && int(idx) == targetIndex {
+				if delta, _ := evt["delta"].(map[string]any); delta != nil {
+					if pj, ok := delta["partial_json"].(string); ok {
+						sb.WriteString(pj)
+					}
+				}
+			}
+		}
+	}
+	require.NotEqual(t, -1, targetIndex)
+	return sb.String()
 }
 
 func TestStreamEventStreamAsAnthropicIgnoresPingFrames(t *testing.T) {
@@ -1495,6 +2220,223 @@ func TestParseNonStreamingEventStreamRestoresShortToolName(t *testing.T) {
 	require.Equal(t, longName, gjson.GetBytes(result.ResponseBody, "content.0.name").String())
 }
 
+func TestAssistantToolSnapshotRequiresIDAndName(t *testing.T) {
+	tests := []struct {
+		name string
+		tool map[string]any
+	}{
+		{
+			name: "missing id",
+			tool: map[string]any{"name": "custom_tool", "input": map[string]any{"value": true}},
+		},
+		{
+			name: "missing name",
+			tool: map[string]any{"toolUseId": "toolu_missing_name", "input": map[string]any{"value": true}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+" non-streaming", func(t *testing.T) {
+			stream := bytes.NewBuffer(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+				"assistantResponseEvent": map[string]any{"toolUses": []map[string]any{tt.tool}},
+			}))
+
+			result, err := ParseNonStreamingEventStreamWithContext(stream, "claude-sonnet-4-5", KiroRequestContext{})
+			require.NoError(t, err)
+			require.Equal(t, "end_turn", result.StopReason)
+			require.NotContains(t, string(result.ResponseBody), `"type":"tool_use"`)
+		})
+
+		t.Run(tt.name+" streaming", func(t *testing.T) {
+			stream := bytes.NewBuffer(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+				"assistantResponseEvent": map[string]any{"toolUses": []map[string]any{tt.tool}},
+			}))
+
+			var out bytes.Buffer
+			result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+			require.NoError(t, err)
+			require.Equal(t, "end_turn", result.StopReason)
+			require.NotContains(t, out.String(), `"type":"tool_use"`)
+		})
+	}
+}
+
+func TestStreamEventStreamAsAnthropicInvalidAssistantSnapshotDoesNotDiscardBufferedSameID(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_invalid_snapshot_same_id",
+			"name":      "custom_tool",
+			"input":     `{"value":"stream"}`,
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"toolUses": []map[string]any{
+				{
+					"toolUseId": "toolu_invalid_snapshot_same_id",
+					"input":     map[string]any{"value": "invalid-snapshot"},
+				},
+			},
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_invalid_snapshot_same_id",
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Equal(t, 1, strings.Count(out.String(), `"id":"toolu_invalid_snapshot_same_id"`))
+	require.JSONEq(t, `{"value":"stream"}`, extractStreamedToolInputJSON(t, out.String(), "toolu_invalid_snapshot_same_id"))
+}
+
+func TestStreamEventStreamAsAnthropicIgnoresStreamingDuplicateAfterAssistantToolSnapshot(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"toolUses": []map[string]any{
+				{
+					"toolUseId": "toolu_same_id_snapshot_first",
+					"name":      "custom_tool",
+					"input":     map[string]any{"value": "snapshot"},
+				},
+			},
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_same_id_snapshot_first",
+			"name":      "custom_tool",
+			"input":     map[string]any{"value": "stale-stream"},
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Equal(t, 1, strings.Count(out.String(), `"id":"toolu_same_id_snapshot_first"`))
+	require.JSONEq(t, `{"value":"snapshot"}`, extractStreamedToolInputJSON(t, out.String(), "toolu_same_id_snapshot_first"))
+}
+
+func TestStreamEventStreamAsAnthropicAssistantToolSnapshotReplacesBufferedSameID(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_same_id_stream_first",
+			"name":      "custom_tool",
+			"input":     `{"value":"stale-stream"}`,
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"toolUses": []map[string]any{
+				{
+					"toolUseId": "toolu_same_id_stream_first",
+					"name":      "custom_tool",
+					"input":     map[string]any{"value": "snapshot"},
+				},
+			},
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Equal(t, 1, strings.Count(out.String(), `"id":"toolu_same_id_stream_first"`))
+	require.JSONEq(t, `{"value":"snapshot"}`, extractStreamedToolInputJSON(t, out.String(), "toolu_same_id_stream_first"))
+}
+
+func TestStreamEventStreamAsAnthropicAssistantToolSnapshotRecoversInvalidStoppedStream(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_same_id_recovery",
+			"name":      "custom_tool",
+			"input":     `{"value":`,
+			"stop":      true,
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"toolUses": []map[string]any{
+				{
+					"toolUseId": "toolu_same_id_recovery",
+					"name":      "custom_tool",
+					"input":     map[string]any{"value": "snapshot"},
+				},
+			},
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Equal(t, 1, strings.Count(out.String(), `"id":"toolu_same_id_recovery"`))
+	require.JSONEq(t, `{"value":"snapshot"}`, extractStreamedToolInputJSON(t, out.String(), "toolu_same_id_recovery"))
+}
+
+func TestStreamEventStreamAsAnthropicDeduplicatesRestoredToolNamesByContent(t *testing.T) {
+	longName := strings.Repeat("long_tool_name_", 6)
+	shortName := shortenToolNameIfNeeded(longName)
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{
+			"toolUses": []map[string]any{
+				{
+					"toolUseId": "toolu_short_aggregate",
+					"name":      shortName,
+					"input":     map[string]any{"value": "same"},
+				},
+			},
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_short_stream",
+			"name":      shortName,
+			"input":     map[string]any{"value": "same"},
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{
+		ToolNameMap: map[string]string{shortName: longName},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Equal(t, 1, strings.Count(out.String(), `"type":"tool_use"`))
+	require.Equal(t, 1, strings.Count(out.String(), `"name":"`+longName+`"`))
+}
+
+func TestStreamEventStreamAsAnthropicNormalizesWebSearchToolName(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_web_search_name",
+			"name":      "web_search",
+			"input":     `{"query":"golang"}`,
+			"stop":      true,
+		},
+	}))
+
+	var out bytes.Buffer
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 9, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Equal(t, "tool_use", result.StopReason)
+	require.Contains(t, out.String(), `"name":"remote_web_search"`)
+	require.NotContains(t, out.String(), `"name":"web_search"`)
+}
+
 func TestStreamEventStreamAsAnthropicRestoresShortToolName(t *testing.T) {
 	longName := strings.Repeat("long_tool_name_", 6)
 	shortName := shortenToolNameIfNeeded(longName)
@@ -1578,6 +2520,122 @@ func TestKiroCacheEmulationUsageInjectedIntoStreamAndResult(t *testing.T) {
 	require.Contains(t, output, `"ephemeral_1h_input_tokens":30`)
 }
 
+func TestNormalizeStreamingToolInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		toolName string
+		raw      string
+		want     map[string]any
+		wantOK   bool
+	}{
+		{
+			name:     "repairs literal control characters and trailing comma",
+			toolName: "ExitPlanMode",
+			raw:      "{\"plan\":\"line one\nline two\t\x00\",}",
+			want:     map[string]any{"plan": "line one\nline two\t\x00"},
+			wantOK:   true,
+		},
+		{
+			name:     "preserves comma closers inside strings",
+			toolName: "ExitPlanMode",
+			raw:      "{\"plan\":\"keep ,} and ,]\nnext\",}",
+			want:     map[string]any{"plan": "keep ,} and ,]\nnext"},
+			wantOK:   true,
+		},
+		{
+			name:     "preserves backslash before literal newline",
+			toolName: "ExitPlanMode",
+			raw:      "{\"plan\":\"echo \\\nnext\"}",
+			want:     map[string]any{"plan": "echo \\\nnext"},
+			wantOK:   true,
+		},
+		{
+			name:     "preserves large integer",
+			toolName: "custom_tool",
+			raw:      `{"id":9007199254740993}`,
+			want:     map[string]any{"id": json.Number("9007199254740993")},
+			wantOK:   true,
+		},
+		{
+			name:     "accepts empty object for unknown tool",
+			toolName: "custom_tool",
+			raw:      `{}`,
+			want:     map[string]any{},
+			wantOK:   true,
+		},
+		{
+			name:     "accepts OpenCode camelCase write path",
+			toolName: "write",
+			raw:      `{"filePath":"/tmp/hello","content":"hello"}`,
+			want:     map[string]any{"filePath": "/tmp/hello", "content": "hello"},
+			wantOK:   true,
+		},
+		{
+			name:     "accepts snake case write path",
+			toolName: "write",
+			raw:      `{"file_path":"/tmp/hello","content":"hello"}`,
+			want:     map[string]any{"file_path": "/tmp/hello", "content": "hello"},
+			wantOK:   true,
+		},
+		{
+			name:     "accepts legacy write path",
+			toolName: "write",
+			raw:      `{"path":"/tmp/hello","content":"hello"}`,
+			want:     map[string]any{"path": "/tmp/hello", "content": "hello"},
+			wantOK:   true,
+		},
+		{
+			name:     "rejects write missing path",
+			toolName: "write",
+			raw:      `{"content":"hello"}`,
+			wantOK:   false,
+		},
+		{
+			name:     "rejects write missing content",
+			toolName: "write",
+			raw:      `{"filePath":"/tmp/hello"}`,
+			wantOK:   false,
+		},
+		{
+			name:     "rejects synthetically completable truncation",
+			toolName: "write_to_file",
+			raw:      `{"path":"main.go","content":"package main`,
+			wantOK:   false,
+		},
+		{
+			name:     "rejects missing required field",
+			toolName: "write_to_file",
+			raw:      `{"path":"main.go"}`,
+			wantOK:   false,
+		},
+		{name: "rejects array", toolName: "custom_tool", raw: `[]`, wantOK: false},
+		{name: "rejects scalar", toolName: "custom_tool", raw: `"value"`, wantOK: false},
+		{name: "rejects null", toolName: "custom_tool", raw: `null`, wantOK: false},
+		// 空/空白输入归一化为 {}，与无参工具调用语义一致；有必填参数的工具则拒绝空输入
+		{name: "accepts empty input for tool without requirements", toolName: "custom_tool", raw: ` `, want: map[string]any{}, wantOK: true},
+		{name: "rejects empty input for tool with requirements", toolName: "write", raw: ` `, wantOK: false},
+		{name: "rejects malformed syntax", toolName: "custom_tool", raw: `{"x":}`, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			normalized, input, ok := normalizeStreamingToolInput(tt.toolName, tt.raw)
+			require.Equal(t, tt.wantOK, ok)
+			if !tt.wantOK {
+				require.Empty(t, normalized)
+				require.Nil(t, input)
+				return
+			}
+			require.Equal(t, tt.want, input)
+			var decoded map[string]any
+			decoder := json.NewDecoder(strings.NewReader(normalized))
+			decoder.UseNumber()
+			require.NoError(t, decoder.Decode(&decoded))
+			require.Equal(t, tt.want, decoded)
+		})
+	}
+}
+
 func TestRepairJSONKeepsStringBracesWhileRepairingTrailingComma(t *testing.T) {
 	raw := `{"key":"value with {nested}",}`
 	repaired := repairJSON(raw)
@@ -1597,9 +2655,13 @@ func TestMapModel_MatchesKiroReferenceMapping(t *testing.T) {
 		"claude-opus-4-7":                     "claude-opus-4.7",
 		"claude-opus-4-7-thinking":            "claude-opus-4.7",
 		"claude-opus-4.7":                     "claude-opus-4.7",
+		"claude-opus-5":                       "claude-opus-5",
+		"claude-opus-5-thinking":              "claude-opus-5",
 		"claude-sonnet-4-6":                   "claude-sonnet-4.6",
 		"claude-sonnet-4-6-thinking":          "claude-sonnet-4.6",
 		"claude-sonnet-4.6":                   "claude-sonnet-4.6",
+		"claude-sonnet-5":                     "claude-sonnet-5",
+		"claude-sonnet-5-thinking":            "claude-sonnet-5",
 		"claude-opus-4-9":                     "claude-opus-4.9",
 		"claude-opus-4-9-thinking":            "claude-opus-4.9",
 		"claude-sonnet-5-0-thinking":          "claude-sonnet-5.0",
@@ -1615,6 +2677,9 @@ func TestMapModel_MatchesKiroReferenceMapping(t *testing.T) {
 		"claude-haiku-4-5-20251001":           "claude-haiku-4.5",
 		"claude-haiku-4-5-20251001-thinking":  "claude-haiku-4.5",
 		"claude-haiku-4.5":                    "claude-haiku-4.5",
+		"gpt-5.6-sol":                         "gpt-5.6-sol",
+		"gpt-5.6-terra":                       "gpt-5.6-terra",
+		"gpt-5.6-luna":                        "gpt-5.6-luna",
 	}
 
 	for input, want := range cases {
@@ -1624,6 +2689,7 @@ func TestMapModel_MatchesKiroReferenceMapping(t *testing.T) {
 	}
 
 	rejected := []string{
+		"gpt-5.6",
 		"claude-sonnet-4-6-chat",
 		" claude-sonnet-4-6-thinking-chat ",
 		"claude-sonnet-4-6-agentic",
@@ -1642,6 +2708,22 @@ func TestMapModel_MatchesKiroReferenceMapping(t *testing.T) {
 	}
 }
 
+func TestKiroMaxOutputTokensForGPT56Models(t *testing.T) {
+	t.Parallel()
+
+	for _, model := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		require.Equal(t, 128000, kiroMaxOutputTokensForModel(model), model)
+	}
+	require.Equal(t, kiroDefaultMaxOutputTokens, kiroMaxOutputTokensForModel("gpt-5.6"))
+}
+
+func TestKiroMaxOutputTokensForOpus5(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 128000, kiroMaxOutputTokensForModel("claude-opus-5"))
+	require.Equal(t, 128000, kiroMaxOutputTokensForModel("claude-opus-5-thinking"))
+}
+
 func TestIsOutputConfigPathModelSupportsFutureVersions(t *testing.T) {
 	t.Parallel()
 
@@ -1649,6 +2731,8 @@ func TestIsOutputConfigPathModelSupportsFutureVersions(t *testing.T) {
 		"claude-opus-4.6":            true,
 		"claude-opus-4-9-thinking":   true,
 		"claude-sonnet-5-0-thinking": true,
+		"claude-opus-5":              true,
+		"claude-opus-5-thinking":     true,
 		"claude-haiku-4.5":           false,
 		"claude-opus-4-5":            false,
 		"gpt-4o":                     false,
@@ -1737,6 +2821,51 @@ func TestStreamEventStreamAsAnthropicEstimatesOutputTokensWhenMissing(t *testing
 	require.Contains(t, deltaSection, `"output_tokens":`, "output_tokens should be present in message_delta")
 }
 
+func TestStreamEventStreamAsAnthropicCapturesKiroCredits(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	var out bytes.Buffer
+
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{"content": "hello world"},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "messageMetadataEvent", map[string]any{
+		"messageMetadataEvent": map[string]any{
+			"tokenUsage": map[string]any{
+				"uncachedInputTokens": 10,
+				"outputTokens":        5,
+			},
+		},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{"usage": 0.12},
+	}))
+	_, _ = stream.Write(buildEventStreamFrame(t, "meteringEvent", map[string]any{
+		"meteringEvent": map[string]any{"usage": 0.05},
+	}))
+
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-sonnet-4-5", 10, KiroRequestContext{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.InDelta(t, 0.17, result.Usage.KiroCredits, 0.000001)
+	require.Contains(t, out.String(), "_sub2api_kiro_credits")
+
+	var delta map[string]any
+	for _, line := range strings.Split(out.String(), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok || !strings.Contains(data, "_sub2api_kiro_credits") {
+			continue
+		}
+		require.NoError(t, json.Unmarshal([]byte(data), &delta))
+		break
+	}
+	require.NotNil(t, delta)
+	usageMap, ok := delta["usage"].(map[string]any)
+	require.True(t, ok)
+	credits, ok := usageMap["_sub2api_kiro_credits"].(float64)
+	require.True(t, ok)
+	require.InDelta(t, 0.17, credits, 0.000001)
+}
+
 func TestStreamEventStreamAsAnthropicStreamingToolInputCountsOutputTokens(t *testing.T) {
 	// Streaming tool input fragments should be counted toward output_tokens estimation.
 	pr, pw := io.Pipe()
@@ -1808,10 +2937,55 @@ func TestStreamEventStreamAsAnthropicUpstreamOutputTokensNotOverridden(t *testin
 	require.Contains(t, deltaSection, `"output_tokens":42`, "upstream outputTokens should not be overridden by estimation")
 }
 
+func TestStreamEventStreamAsAnthropicStopsAfterToolBlockWriteError(t *testing.T) {
+	stream := bytes.NewBuffer(buildEventStreamFrame(t, "toolUseEvent", map[string]any{
+		"toolUseEvent": map[string]any{
+			"toolUseId": "toolu_write_error",
+			"name":      "bash",
+			"input":     `{"command":"echo hello"}`,
+			"stop":      true,
+		},
+	}))
+	writeErr := errors.New("forced write failure")
+	writer := &failAfterWritesWriter{failAt: 3, err: writeErr}
+
+	result, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, writer, "claude-sonnet-4-5", 10, KiroRequestContext{})
+	require.Nil(t, result)
+	require.ErrorIs(t, err, writeErr)
+	require.Contains(t, writer.String(), `event: content_block_start`)
+	require.NotContains(t, writer.String(), `event: content_block_stop`)
+	require.NotContains(t, writer.String(), `event: message_delta`)
+	require.NotContains(t, writer.String(), `event: message_stop`)
+}
+
+type failAfterWritesWriter struct {
+	buffer bytes.Buffer
+	writes int
+	failAt int
+	err    error
+}
+
+func (w *failAfterWritesWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failAt {
+		return 0, w.err
+	}
+	return w.buffer.Write(p)
+}
+
+func (w *failAfterWritesWriter) String() string {
+	return w.buffer.String()
+}
+
 func buildEventStreamFrame(t *testing.T, eventType string, payload any) []byte {
 	t.Helper()
 	payloadBytes, err := json.Marshal(payload)
 	require.NoError(t, err)
+	return buildRawEventStreamFrame(t, eventType, payloadBytes)
+}
+
+func buildRawEventStreamFrame(t *testing.T, eventType string, payloadBytes []byte) []byte {
+	t.Helper()
 
 	headers := bytes.NewBuffer(nil)
 	_ = headers.WriteByte(byte(len(":event-type")))

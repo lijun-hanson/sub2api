@@ -288,21 +288,21 @@ func TestUsageLogRepositoryCreateBestEffort_BatchPathDuplicateRequestID(t *testi
 	}, 3*time.Second, 20*time.Millisecond)
 }
 
-func TestUsageLogRepositoryCreateBestEffort_QueueFullReturnsDropped(t *testing.T) {
-	ctx := context.Background()
+func TestUsageLogRepositoryCreateBestEffort_QueueFullBlocksUntilCtxDeadline(t *testing.T) {
+	// 队列满时不再立即丢弃：阻塞等待入队，直到调用方 ctx 到期才标记 dropped（issue #3656）。
 	client := testEntClient(t)
 	repo := newUsageLogRepositoryWithSQL(client, integrationDB)
 	repo.bestEffortBatchCh = make(chan usageLogBestEffortRequest, 1)
 	repo.bestEffortBatchCh <- usageLogBestEffortRequest{}
 
-	user := mustCreateUser(t, client, &service.User{Email: fmt.Sprintf("usage-best-effort-full-%d@example.com", time.Now().UnixNano())})
-	apiKey := mustCreateApiKey(t, client, &service.APIKey{UserID: user.ID, Key: "sk-usage-best-effort-full-" + uuid.NewString(), Name: "k"})
-	account := mustCreateAccount(t, client, &service.Account{Name: "acc-usage-best-effort-full-" + uuid.NewString()})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
 
+	start := time.Now()
 	err := repo.CreateBestEffort(ctx, &service.UsageLog{
-		UserID:       user.ID,
-		APIKeyID:     apiKey.ID,
-		AccountID:    account.ID,
+		UserID:       1,
+		APIKeyID:     2,
+		AccountID:    3,
 		RequestID:    uuid.NewString(),
 		Model:        "claude-3",
 		InputTokens:  10,
@@ -314,6 +314,40 @@ func TestUsageLogRepositoryCreateBestEffort_QueueFullReturnsDropped(t *testing.T
 
 	require.Error(t, err)
 	require.True(t, service.IsUsageLogCreateDropped(err))
+	require.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond)
+}
+
+func TestUsageLogRepositoryCreateBestEffort_QueueFullWaitsForDrain(t *testing.T) {
+	// 队列满但批处理器随后排空时，阻塞的入队应成功完成而非丢弃。
+	client := testEntClient(t)
+	repo := newUsageLogRepositoryWithSQL(client, integrationDB)
+	repo.bestEffortBatchCh = make(chan usageLogBestEffortRequest, 1)
+	repo.bestEffortBatchCh <- usageLogBestEffortRequest{}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		<-repo.bestEffortBatchCh // 排空占位请求，为阻塞中的入队腾出空间
+		req := <-repo.bestEffortBatchCh
+		sendUsageLogBestEffortResult(req.resultCh, nil)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := repo.CreateBestEffort(ctx, &service.UsageLog{
+		UserID:       1,
+		APIKeyID:     2,
+		AccountID:    3,
+		RequestID:    uuid.NewString(),
+		Model:        "claude-3",
+		InputTokens:  10,
+		OutputTokens: 20,
+		TotalCost:    0.5,
+		ActualCost:   0.5,
+		CreatedAt:    time.Now().UTC(),
+	})
+
+	require.NoError(t, err)
 }
 
 func TestUsageLogRepositoryCreate_BatchPathCanceledContextMarksNotPersisted(t *testing.T) {
@@ -346,7 +380,7 @@ func TestUsageLogRepositoryCreate_BatchPathCanceledContextMarksNotPersisted(t *t
 }
 
 func TestUsageLogRepositoryCreate_BatchPathQueueFullMarksNotPersisted(t *testing.T) {
-	ctx := context.Background()
+	// 队列满时阻塞等待入队，直到调用方 ctx 到期才标记 not persisted（issue #3656）。
 	client := testEntClient(t)
 	repo := newUsageLogRepositoryWithSQL(client, integrationDB)
 	repo.createBatchCh = make(chan usageLogCreateRequest, 1)
@@ -356,6 +390,10 @@ func TestUsageLogRepositoryCreate_BatchPathQueueFullMarksNotPersisted(t *testing
 	apiKey := mustCreateApiKey(t, client, &service.APIKey{UserID: user.ID, Key: "sk-usage-create-full-" + uuid.NewString(), Name: "k"})
 	account := mustCreateAccount(t, client, &service.Account{Name: "acc-usage-create-full-" + uuid.NewString()})
 
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
 	inserted, err := repo.Create(ctx, &service.UsageLog{
 		UserID:       user.ID,
 		APIKeyID:     apiKey.ID,
@@ -372,6 +410,7 @@ func TestUsageLogRepositoryCreate_BatchPathQueueFullMarksNotPersisted(t *testing
 	require.False(t, inserted)
 	require.Error(t, err)
 	require.True(t, service.IsUsageLogCreateNotPersisted(err))
+	require.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond)
 }
 
 func TestUsageLogRepositoryCreate_BatchPathCanceledAfterQueueMarksNotPersisted(t *testing.T) {
@@ -867,6 +906,7 @@ func (s *UsageLogRepoSuite) TestGetAccountTodayStats() {
 
 	m1 := 1.5
 	m2 := 0.0
+	kiroCredits := 0.17
 	_, err := s.repo.Create(s.ctx, &service.UsageLog{
 		UserID:                user.ID,
 		APIKeyID:              apiKey.ID,
@@ -878,6 +918,7 @@ func (s *UsageLogRepoSuite) TestGetAccountTodayStats() {
 		TotalCost:             1.0,
 		ActualCost:            2.0,
 		AccountRateMultiplier: &m1,
+		KiroCredits:           &kiroCredits,
 		CreatedAt:             createdAt,
 	})
 	s.Require().NoError(err)
@@ -906,6 +947,7 @@ func (s *UsageLogRepoSuite) TestGetAccountTodayStats() {
 	s.Require().InEpsilon(1.5, stats.StandardCost, 0.0001)
 	// user cost = SUM(actual_cost)
 	s.Require().InEpsilon(3.0, stats.UserCost, 0.0001)
+	s.Require().InEpsilon(0.17, stats.KiroCredits, 0.0001)
 }
 
 func (s *UsageLogRepoSuite) TestDashboardAggregationConsistency() {
@@ -1255,18 +1297,29 @@ func (s *UsageLogRepoSuite) TestGetAccountWindowStats() {
 	user := mustCreateUser(s.T(), s.client, &service.User{Email: "windowstats@test.com"})
 	apiKey := mustCreateApiKey(s.T(), s.client, &service.APIKey{UserID: user.ID, Key: "sk-windowstats", Name: "k"})
 	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-windowstats"})
+	otherAccount := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-windowstats-other"})
 
 	now := time.Now()
 	windowStart := now.Add(-10 * time.Minute)
 
 	s.createUsageLog(user, apiKey, account, 10, 20, 0.5, now.Add(-5*time.Minute))
-	s.createUsageLog(user, apiKey, account, 15, 25, 0.6, now.Add(-3*time.Minute))
+	log := s.createUsageLog(user, apiKey, account, 15, 25, 0.6, now.Add(-3*time.Minute))
+	credits := 0.33
+	log.KiroCredits = &credits
+	_, err := s.tx.ExecContext(s.ctx, "UPDATE usage_logs SET kiro_credits = $1 WHERE id = $2", credits, log.ID)
+	s.Require().NoError(err)
 	s.createUsageLog(user, apiKey, account, 20, 30, 0.7, now.Add(-30*time.Minute)) // outside window
 
 	stats, err := s.repo.GetAccountWindowStats(s.ctx, account.ID, windowStart)
 	s.Require().NoError(err, "GetAccountWindowStats")
 	s.Require().Equal(int64(2), stats.Requests)
 	s.Require().Equal(int64(70), stats.Tokens) // (10+20) + (15+25)
+	s.Require().InEpsilon(0.33, stats.KiroCredits, 0.0001)
+
+	batchStats, err := s.repo.GetAccountWindowStatsBatch(s.ctx, []int64{account.ID, otherAccount.ID}, windowStart)
+	s.Require().NoError(err, "GetAccountWindowStatsBatch")
+	s.Require().InEpsilon(0.33, batchStats[account.ID].KiroCredits, 0.0001)
+	s.Require().Zero(batchStats[otherAccount.ID].KiroCredits)
 }
 
 // --- GetUserUsageTrendByUserID ---

@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -30,6 +32,9 @@ type DataPayload struct {
 	ExportedAt string        `json:"exported_at"`
 	Proxies    []DataProxy   `json:"proxies"`
 	Accounts   []DataAccount `json:"accounts"`
+	// SkippedShadows 记录导出时被排除的 spark 影子账号数量(见 ExportData)。仅作可见性提示,
+	// 导入侧忽略该字段;omitempty 保持向后兼容。
+	SkippedShadows int `json:"skipped_shadows,omitempty"`
 }
 
 type DataProxy struct {
@@ -50,6 +55,10 @@ type DataProxy struct {
 // DataAccount 是管理员显式备份导出使用的账号结构，故意不走 dto.Account 的脱敏路径，
 // Credentials 原文返回。这是"管理员备份"这一显式行为的一部分；如未来需要导出脱敏版本，
 // 应新增独立结构而非修改这里。
+// 注意:本结构不含 parent_account_id/quota_dimension——spark 影子账号在 ExportData 处被显式
+// 排除(影子不持凭据、通用凭据型导入强制 credentials 非空无法重建父子链接),不在此表达。
+// 影子的独立调度配置(priority/并发/分组/status 管理员可单独调)亦不在本备份范围,属已知局限
+// (外审第6轮裁决:保持排除 + 前端警告,而非升级格式做完整往返)。
 type DataAccount struct {
 	Name               string         `json:"name"`
 	Notes              *string        `json:"notes,omitempty"`
@@ -66,8 +75,8 @@ type DataAccount struct {
 }
 
 type DataImportRequest struct {
-	Data                 DataPayload `json:"data"`
-	SkipDefaultGroupBind *bool       `json:"skip_default_group_bind"`
+	Data                 json.RawMessage `json:"data"`
+	SkipDefaultGroupBind *bool           `json:"skip_default_group_bind"`
 }
 
 type DataImportResult struct {
@@ -103,6 +112,24 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
+	}
+
+	// 排除 spark 影子账号:影子不持凭据,通用凭据型导出无法表达父子链接、导入侧又强制 credentials
+	// 非空——若混入会产出无法还原的坏备份(导入即失败)。影子的独立调度配置(priority/并发/分组/
+	// status,管理员可单独调)随之不进备份,还原后需在重建的影子上重新调优;前端按 skipped_shadows
+	// 提示用户(外审第5轮发现、第6轮裁决:保持排除 + 警告,不做完整往返)。
+	skippedShadows := 0
+	exportable := make([]service.Account, 0, len(accounts))
+	for i := range accounts {
+		if accounts[i].IsCredentialShadow() {
+			skippedShadows++
+			continue
+		}
+		exportable = append(exportable, accounts[i])
+	}
+	accounts = exportable
+	if skippedShadows > 0 {
+		slog.Info("export_skipped_spark_shadows", "count", skippedShadows)
 	}
 
 	includeProxies, err := parseIncludeProxies(c)
@@ -191,9 +218,10 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 	}
 
 	payload := DataPayload{
-		ExportedAt: time.Now().UTC().Format(time.RFC3339),
-		Proxies:    dataProxies,
-		Accounts:   dataAccounts,
+		ExportedAt:     time.Now().UTC().Format(time.RFC3339),
+		Proxies:        dataProxies,
+		Accounts:       dataAccounts,
+		SkippedShadows: skippedShadows,
 	}
 
 	response.Success(c, payload)
@@ -206,23 +234,27 @@ func (h *AccountHandler) ImportData(c *gin.Context) {
 		return
 	}
 
-	if err := validateDataHeader(req.Data); err != nil {
+	dataPayload, err := parseDataImportPayload(req.Data)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if err := validateDataHeader(dataPayload); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 
 	executeAdminIdempotentJSON(c, "admin.accounts.import_data", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
-		return h.importData(ctx, req)
+		return h.importData(ctx, req, dataPayload)
 	})
 }
 
-func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) (DataImportResult, error) {
+func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest, dataPayload DataPayload) (DataImportResult, error) {
 	skipDefaultGroupBind := true
 	if req.SkipDefaultGroupBind != nil {
 		skipDefaultGroupBind = *req.SkipDefaultGroupBind
 	}
 
-	dataPayload := req.Data
 	result := DataImportResult{}
 
 	existingProxies, err := h.listAllProxies(ctx)
@@ -434,6 +466,7 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		if created.Platform == service.PlatformAntigravity && created.Type == service.AccountTypeOAuth {
 			privacyAccounts = append(privacyAccounts, created)
 		}
+		h.scheduleGrokImportProbe(created)
 		result.AccountCreated++
 	}
 
@@ -605,6 +638,24 @@ func parseIncludeProxies(c *gin.Context) (bool, error) {
 		return false, nil
 	default:
 		return true, fmt.Errorf("invalid include_proxies value: %s", raw)
+	}
+}
+
+func parseDataImportPayload(raw json.RawMessage) (DataPayload, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return DataPayload{}, errors.New("data is required")
+	}
+
+	switch trimmed[0] {
+	case '{':
+		var payload DataPayload
+		if err := json.Unmarshal(trimmed, &payload); err != nil {
+			return DataPayload{}, fmt.Errorf("data JSON 解析失败: %w", err)
+		}
+		return payload, nil
+	default:
+		return DataPayload{}, errors.New("unsupported data format: expected sub2api data export object")
 	}
 }
 

@@ -80,7 +80,7 @@ const defaultFilters = () => ({
   end_date: '',
 })
 
-function mountFilters(filters = defaultFilters()) {
+function mountFilters(filters = defaultFilters(), props: Record<string, any> = {}) {
   return mount(UsageFilters, {
     props: {
       modelValue: filters,
@@ -89,6 +89,7 @@ function mountFilters(filters = defaultFilters()) {
       endDate: '2026-05-28',
       showActions: false,
       modelOptions: [],
+      ...props,
     },
     global: {
       stubs: {
@@ -97,6 +98,17 @@ function mountFilters(filters = defaultFilters()) {
       },
     },
   })
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve
+    reject = promiseReject
+  })
+
+  return { promise, resolve, reject }
 }
 
 describe('UsageFilters — user search dropdown', () => {
@@ -162,6 +174,73 @@ describe('UsageFilters — user search dropdown', () => {
     // Also confirm user_id was set by checking the emitted change came through
     // (the component uses toRef so modelValue is mutated in place and 'change' is emitted)
     expect(wrapper.props('modelValue').user_id).toBe(1)
+  })
+
+  it('keeps results from the latest user search when responses arrive out of order', async () => {
+    const firstSearch = deferred<Array<{ id: number; email: string; deleted: boolean }>>()
+    const secondSearch = deferred<Array<{ id: number; email: string; deleted: boolean }>>()
+    mockSearchUsers
+      .mockImplementationOnce(() => firstSearch.promise)
+      .mockImplementationOnce(() => secondSearch.promise)
+
+    const wrapper = mountFilters()
+    const input = wrapper.find('input[type="text"]')
+    await input.trigger('focus')
+
+    await input.setValue('a')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+
+    await input.setValue('ab')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+
+    secondSearch.resolve([{ id: 2, email: 'ab@test.com', deleted: false }])
+    await flushPromises()
+    expect(wrapper.text()).toContain('ab@test.com')
+
+    firstSearch.resolve([{ id: 1, email: 'a@test.com', deleted: false }])
+    await flushPromises()
+    expect(wrapper.text()).toContain('ab@test.com')
+    expect(wrapper.text()).not.toContain('a@test.com')
+  })
+
+  it('does not restore stale user results after the search is cleared', async () => {
+    const pendingSearch = deferred<Array<{ id: number; email: string; deleted: boolean }>>()
+    mockSearchUsers.mockImplementationOnce(() => pendingSearch.promise)
+
+    const wrapper = mountFilters()
+    const input = wrapper.find('input[type="text"]')
+    await input.trigger('focus')
+
+    await input.setValue('stale')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+
+    await input.setValue('')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+
+    pendingSearch.resolve([{ id: 3, email: 'stale@test.com', deleted: false }])
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('stale@test.com')
+  })
+})
+
+describe('UsageFilters — error mode actions', () => {
+  it('keeps cleanup available for the error requests tab', async () => {
+    const wrapper = mountFilters(defaultFilters(), {
+      mode: 'errors',
+      showActions: true,
+    })
+
+    const cleanupButton = wrapper.findAll('button').find((button) => button.text() === 'Cleanup')
+    expect(cleanupButton).toBeTruthy()
+
+    await cleanupButton!.trigger('click')
+
+    expect(wrapper.emitted('cleanup')).toHaveLength(1)
+    expect(wrapper.text()).not.toContain('Export')
   })
 })
 

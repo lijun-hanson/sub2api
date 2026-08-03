@@ -84,6 +84,8 @@ linters:
         - fmt.Fprint
         - fmt.Fprintf
         - fmt.Fprintln
+        # strings.Builder.WriteString is documented to always return a nil error.
+        - (*strings.Builder).WriteString
       # Display function signature instead of selector.
       # Default: false
       verbose: true

@@ -38,6 +38,10 @@ func TestDefaultKiroModelMapping_MatchesKiroReferenceModels(t *testing.T) {
 		"claude-opus-4-7-thinking":            "claude-opus-4.7",
 		"claude-opus-4-6":                     "claude-opus-4.6",
 		"claude-opus-4-6-thinking":            "claude-opus-4.6",
+		"claude-opus-5":                       "claude-opus-5",
+		"claude-opus-5-thinking":              "claude-opus-5",
+		"claude-sonnet-5":                     "claude-sonnet-5",
+		"claude-sonnet-5-thinking":            "claude-sonnet-5",
 		"claude-sonnet-4-6":                   "claude-sonnet-4.6",
 		"claude-sonnet-4-6-thinking":          "claude-sonnet-4.6",
 		"claude-opus-4-5-20251101":            "claude-opus-4.5",
@@ -46,6 +50,9 @@ func TestDefaultKiroModelMapping_MatchesKiroReferenceModels(t *testing.T) {
 		"claude-sonnet-4-5-20250929-thinking": "claude-sonnet-4.5",
 		"claude-haiku-4-5-20251001":           "claude-haiku-4.5",
 		"claude-haiku-4-5-20251001-thinking":  "claude-haiku-4.5",
+		"gpt-5.6-sol":                         "gpt-5.6-sol",
+		"gpt-5.6-terra":                       "gpt-5.6-terra",
+		"gpt-5.6-luna":                        "gpt-5.6-luna",
 	}
 
 	if len(DefaultKiroModelMapping) != len(expected) {
@@ -65,6 +72,7 @@ func TestDefaultKiroModelMapping_MatchesKiroReferenceModels(t *testing.T) {
 		"claude-3-5-haiku-20241022",
 		"gpt-4o",
 		"gpt-4",
+		"gpt-5.6",
 		"deepseek-3-2",
 		"minimax-m2-1",
 		"qwen3-coder-next",
@@ -91,6 +99,28 @@ func TestDefaultAntigravityModelMapping_ContainsNewClaudeModels(t *testing.T) {
 		"claude-fable-5":  "claude-fable-5",
 		"claude-opus-4-8": "claude-opus-4-8",
 	}
+	for from, want := range cases {
+		got, ok := DefaultAntigravityModelMapping[from]
+		if !ok {
+			t.Fatalf("expected mapping for %q to exist", from)
+		}
+		if got != want {
+			t.Fatalf("unexpected mapping for %q: got %q want %q", from, got, want)
+		}
+	}
+}
+
+func TestDefaultAntigravityModelMapping_Gemini31ProAliases(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		AntigravityGemini31ProAgentModel: AntigravityGemini31ProAgentModel,
+		"gemini-3.1-pro":                 AntigravityGemini31ProAgentModel,
+		"gemini-3.1-pro-high":            AntigravityGemini31ProAgentModel,
+		"gemini-3.1-pro-preview":         AntigravityGemini31ProAgentModel,
+		"gemini-3.1-pro-low":             "gemini-3.1-pro-low",
+	}
+
 	for from, want := range cases {
 		got, ok := DefaultAntigravityModelMapping[from]
 		if !ok {
